@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--gt-sdf", required=True)
     ap.add_argument("--coarse-sdf", required=True)
     ap.add_argument("--out", default="outputs/flow_fold0")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from outputs/.../last.pt if present (survives Colab disconnects)")
     a = ap.parse_args()
 
     cfg = load_yaml(a.config)
@@ -67,7 +69,18 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
 
     best = {"score": -1.0, "hd95": 1e9}
-    for ep in range(epochs):
+    start_epoch = 0
+    last_path = os.path.join(a.out, "last.pt")
+    if a.resume and os.path.isfile(last_path):
+        ck = torch.load(last_path, map_location=dev)
+        model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        start_epoch = ck["epoch"] + 1
+        best = ck["best"]
+        print(f"[resume] continuing from epoch {start_epoch} (best score {best['score']:.3f})")
+
+    for ep in range(start_epoch, epochs):
         model.train(); t0 = time.time(); run = 0.0; nb = 0
         for cond, x0, x1 in dl:
             cond, x0, x1 = cond.to(dev), x0.to(dev), x1.to(dev)
@@ -84,6 +97,11 @@ def main():
             opt.step(); run += comp["total"]; nb += 1
         sched.step()
 
+        # resume checkpoint every epoch (cheap; optimizer+scheduler+epoch+best)
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict(), "epoch": ep, "best": best, "cfg": cfg},
+                   last_path)
+
         if ep % cfg.get("val_every", 25) == 0 or ep == epochs - 1:
             m = validate(model, val_ids, a.images, a.coarse_sdf, a.labels,
                          patch=cfg.get("patch", 96), steps=cfg.get("ode_steps", 8),
@@ -98,12 +116,6 @@ def main():
                   f"clDice {m['cldice']:.3f} HD95 {m['hd95']:.2f} score {m['score']:.3f} "
                   f"{'*BEST*' if better else ''}  {time.time()-t0:.0f}s", flush=True)
     print("[train] done. best:", best, "->", os.path.join(a.out, "best.pt"))
-
-
-def _safe_validate(model, val_ids, a, cfg, dev):
-    return validate(model, val_ids, a.images, a.coarse_sdf, a.labels,
-                    patch=cfg.get("patch", 96), steps=cfg.get("ode_steps", 8),
-                    device=dev, max_cases=cfg.get("val_max_cases", 20))
 
 
 if __name__ == "__main__":
