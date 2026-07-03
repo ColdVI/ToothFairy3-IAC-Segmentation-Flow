@@ -1,0 +1,8 @@
+# IAC segmentation pipeline — local/dev requirements
+nibabel>=5.0
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+pyyaml>=6.0         # config files (flow/train.py falls back to JSON if absent)
+torch>=2.1          # CPU is fine for editing/selftest/tests; CUDA build needed for real training
+nnunetv2            # only needed for Track A (nnU-Net baseline)

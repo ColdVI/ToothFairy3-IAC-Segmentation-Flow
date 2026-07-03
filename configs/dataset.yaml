@@ -1,0 +1,19 @@
+# Dataset build + split configuration.
+source_root: /path/to/ToothFairy3          # imagesTr/ labelsTr/ dataset.json
+nnunet_dataset_id: 801
+nnunet_dataset_name: IAC_LR                 # -> Dataset801_IAC_LR
+labels:
+  background: 0
+  Left_IAC: 1
+  Right_IAC: 2
+required_orientation: RPI
+
+# 5-fold CV over P+F (same scanner); S is held-out external OOD test.
+folds: 5
+seed: 1234
+subsets:
+  development: [P, F]
+  external_test: [S]
+
+# physical SDF caches
+sdf_clip_mm: 10.0

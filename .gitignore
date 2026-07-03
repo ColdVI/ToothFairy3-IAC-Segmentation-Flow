@@ -1,0 +1,22 @@
+# Python virtual environment (1.2 GB — never commit)
+.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# generated outputs / caches
+outputs/
+*.npz
+nnUNet_raw/
+nnUNet_preprocessed/
+nnUNet_results/
+configs/splits.json
+
+# large data (never commit CBCT volumes)
+*.nii
+*.nii.gz
+
+# OS / editor
+.DS_Store
+.ipynb_checkpoints/
+*.swp

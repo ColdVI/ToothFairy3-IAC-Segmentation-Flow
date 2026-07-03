@@ -1,0 +1,23 @@
+# nnU-Net baseline experiments (Track A).
+dataset_id: 801
+configuration: 3d_fullres
+
+# A0 stock / A1 all-mirroring-off / A2 only-L-R-mirroring-off
+experiments:
+  A0: {trainer: nnUNetTrainer,               note: "stock nnU-Net"}
+  A1: {trainer: nnUNetTrainerIAC_NoMirror,   note: "all mirroring off"}
+  A2: {trainer: nnUNetTrainerIAC_NoLRMirror, note: "only physical L/R axis off"}
+
+# test-time augmentation mirroring is disabled for prediction in all cases
+disable_tta: true
+
+# out-of-fold prediction for the flow prior (leakage-free)
+oof:
+  trainer: nnUNetTrainerIAC_NoMirror   # best baseline, chosen after A0-A2 on CV
+  out: outputs/oof_probs
+
+# connected-component postprocessing (TUNE on CV; report raw + postprocessed)
+postprocess:
+  min_volume_mm3: 2.0
+  max_gap_mm: 3.0
+  keep_multiple: true
