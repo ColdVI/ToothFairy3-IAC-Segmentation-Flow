@@ -10,6 +10,22 @@ CBCT'de **sol/sağ IAC** segmentasyonu, iki track:
   **nnU-Net çıktısından** başlar. `x0 = SDF(nnU-Net)`, `x1 = SDF(GT)`, model residual
   hızı öğrenir. **Leakage-free**: flow yalnızca out-of-fold nnU-Net tahminleriyle eğitilir.
 
+## Proje fazı / yol haritası — UNUTMA (amaçlar karışmasın)
+Notebook'ta **iki AYRI eğitim** var ve bunlar bağımsız/alternatif DEĞİL — B, A'nın üstüne kurulu:
+- **Track A = klasik diskriminatif segmentasyon** (voksel sınıflandırma), tek başına çalışır.
+- **Track B = üretici flow matching**, ama gürültüden değil **A'nın çıktısını rafine eder**
+  (residual). Zorunlu sıra: A → OOF → SDF → B. B, A olmadan çalışamaz.
+
+**ŞU ANKİ FAZ = yalnız Track A.** Kullanıcı (Anıl) bu alanda hakimiyet kazanmak için
+önce nnU-Net konfigürasyon/pipeline mimarisini oturtuyor; bu dataset üzerindeki mevcut
+literatürün tamamı da Track-A tarzı (nnU-Net). **Track B, haftalar–bir ay SONRA** açılacak
+(SEAL-Flow esinli flow matching: github.com/Vaugh3/SEAL-Flow-...). O ana kadar flow'a
+öncelik verme, Track A'yı sağlamlaştır.
+
+**Bilimsel kıyas = A tek başına vs. (A+B)** — yani "flow, nnU-Net'in üstüne topolojik iyileşme
+katıyor mu?". Bu A-vs-(A+B) eşleşmiş karşılaştırması (evaluate_cv.compare_bootstrap) henüz
+notebook'a bağlı DEĞİL; Track B fazına geçmeden önce yazılacak asıl eksik bu.
+
 ## Dataset — KRİTİK
 - **ToothFairy3** (TF4 DEĞİL; TF4 rapor üretme, voxel etiketi yok).
 - Etiketler **isimle** çözülür; bulunamazsa RAISE (sessiz 3/4 fallback YOK). Bkz.
