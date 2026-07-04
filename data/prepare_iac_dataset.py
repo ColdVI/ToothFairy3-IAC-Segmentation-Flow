@@ -12,15 +12,38 @@ P0 correctness rules (v1.0 spec):
   ("left/right inferior alveolar canal"). If the names are not found we
   RAISE — the old silent fallback to ids 3/4 is gone, because a schema change
   would then quietly grab the wrong (incisive/lingual) canals.
-* Every written case is validated: image/label shape, affine, spacing and
-  orientation must match; orientation must be RPI; output labels must be a
-  subset of {0,1,2}; both sides must have >0 voxels (else the case is dropped
-  and reported, never silently kept half-empty).
+* Every written case is validated: image/label shape, affine and spacing must
+  match (else dropped and reported — never silently kept half-consistent).
+  If the source orientation is not RPI, both volumes are reoriented to RPI
+  using the affine's direction cosines (nibabel `io_orientation` /
+  `apply_orientation`) — this reads the true anatomical direction from the
+  affine and permutes/flips accordingly, so left/right stays physically
+  correct; it is not a guessed axis flip. Output labels must be a subset of
+  {0,1,2}; both sides must have >0 voxels (else dropped and reported).
+
+P0 correctness rule — external test isolation:
+* `--subset PF` restricts conversion to the P+F development scanner cases ONLY.
+  Use this for the nnU-Net TRAINING raw dataset. Without it, S (the held-out
+  external OOD test set) is written into the same imagesTr/labelsTr that
+  nnU-Net's automatic fingerprinting/preprocessing/5-fold CV consumes, so S
+  silently leaks into training (nnU-Net has no notion of P/F/S — it will use
+  every case present in imagesTr). Convert S separately, later, into its own
+  `--dst` folder, only when running the final external evaluation.
 
 Usage
 -----
-    python data/prepare_iac_dataset.py --src /path/ToothFairy3 \
-        --dst $nnUNet_raw/Dataset801_IAC_LR [--copy-images] [--limit N] [--workers 8]
+    # training set (development only, S excluded):
+    python data/prepare_iac_dataset.py --src /path/ToothFairy3 --subset PF \
+        --dst $nnUNet_raw/Dataset801_IAC_LR [--copy-images] [--workers 8]
+
+    # external S set, built separately, only for the final held-out eval:
+    python data/prepare_iac_dataset.py --src /path/ToothFairy3 --subset S \
+        --dst outputs/external_S_raw --copy-images
+
+    # exact reproducible subset (e.g. a FAST/smoke-test slice matching a
+    # splits file), instead of an arbitrary alphabetical --limit:
+    python data/prepare_iac_dataset.py --src /path/ToothFairy3 --subset PF \
+        --ids-file outputs/fast_ids.json --dst ...
 """
 import argparse
 import json
@@ -34,9 +57,10 @@ import numpy as np
 import nibabel as nib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from io_utils import orientation_code, voxel_spacing, affines_match  # noqa: E402
+from io_utils import orientation_code, voxel_spacing, affines_match, reorient_to_code  # noqa: E402
 
-CASE_RE = re.compile(r"(ToothFairy3[FPS]_\d+)")
+CASE_RE = re.compile(r"(ToothFairy3([FPS])_\d+)")
+SUBSET_LETTERS = {"P": {"P"}, "F": {"F"}, "S": {"S"}, "PF": {"P", "F"}, "all": {"P", "F", "S"}}
 L_NAME = "left inferior alveolar canal"
 R_NAME = "right inferior alveolar canal"
 REQUIRED_ORIENTATION = "RPI"
@@ -67,6 +91,12 @@ def case_stem(fname):
     return m.group(1) if m else None
 
 
+def subset_letter(cid):
+    """'P', 'F' or 'S' scanner-subset letter from a case id like 'ToothFairy3F_002'."""
+    m = CASE_RE.search(cid)
+    return m.group(2) if m else None
+
+
 def pair_cases(src):
     img_dir = os.path.join(src, "imagesTr")
     lab_dir = os.path.join(src, "labelsTr")
@@ -88,6 +118,8 @@ def convert_one(args):
     img_img = nib.load(img_path)
     ld = np.asanyarray(lab_img.dataobj)
 
+    # These check img/label CONSISTENCY (real corruption if they disagree) —
+    # kept as hard-fails regardless of which orientation convention was used.
     problems = []
     if ld.shape != img_img.shape:
         problems.append(f"shape img{img_img.shape} != lab{ld.shape}")
@@ -95,11 +127,16 @@ def convert_one(args):
         problems.append("affine mismatch")
     if not np.allclose(voxel_spacing(img_img), voxel_spacing(lab_img), atol=1e-3):
         problems.append("spacing mismatch")
-    ori = orientation_code(lab_img.affine)
-    if ori != REQUIRED_ORIENTATION:
-        problems.append(f"orientation {ori} != {REQUIRED_ORIENTATION}")
     if problems:
         return sid, -1, -1, "; ".join(problems)
+
+    lab_affine = lab_img.affine
+    ori = orientation_code(lab_affine)
+    reoriented = ori != REQUIRED_ORIENTATION
+    if reoriented:
+        # img and label share one affine (checked above), so the same
+        # affine-driven transform is anatomically valid for both.
+        ld, lab_affine = reorient_to_code(ld, lab_affine, REQUIRED_ORIENTATION)
 
     out = np.zeros(ld.shape, dtype=np.uint8)
     out[ld == left_id] = 1
@@ -111,14 +148,24 @@ def convert_one(args):
     if n_l == 0 or n_r == 0:
         return sid, n_l, n_r, "missing-side"
 
-    new_lab = nib.Nifti1Image(out, lab_img.affine, lab_img.header)
+    if reoriented:
+        new_lab = nib.Nifti1Image(out, lab_affine)   # stale header (pixdim/dim order) discarded
+    else:
+        new_lab = nib.Nifti1Image(out, lab_affine, lab_img.header)
     new_lab.set_data_dtype(np.uint8)
     nib.save(new_lab, os.path.join(dst, "labelsTr", f"{sid}.nii.gz"))
 
     dst_img = os.path.join(dst, "imagesTr", f"{sid}_0000.nii.gz")
     if os.path.lexists(dst_img):
         os.remove(dst_img)
-    if copy_images:
+    if reoriented:
+        # array itself changed -> must materialise a new file, symlink/copy no longer valid
+        idata, img_affine = reorient_to_code(np.asanyarray(img_img.dataobj), img_img.affine,
+                                              REQUIRED_ORIENTATION)
+        new_img = nib.Nifti1Image(idata, img_affine)
+        new_img.set_data_dtype(img_img.get_data_dtype())
+        nib.save(new_img, dst_img)
+    elif copy_images:
         shutil.copy2(img_path, dst_img)
     else:
         os.symlink(os.path.realpath(img_path), dst_img)
@@ -130,7 +177,18 @@ def main():
     ap.add_argument("--src", required=True, help="ToothFairy3 root (imagesTr/labelsTr/dataset.json)")
     ap.add_argument("--dst", required=True, help="output, e.g. $nnUNet_raw/Dataset801_IAC_LR")
     ap.add_argument("--copy-images", action="store_true", help="hard-copy images instead of symlinking")
-    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--subset", default="all", choices=sorted(SUBSET_LETTERS),
+                     help="'PF' = development only (use for nnU-Net training raw set, excludes S); "
+                          "'S' = external OOD test only (build separately, final eval only); "
+                          "'all' = everything (do NOT feed this into nnU-Net training)")
+    ap.add_argument("--ids-file", default=None,
+                     help="JSON file with a list of case ids to include (exact match, e.g. a "
+                          "FAST/smoke-test slice) — use instead of --limit when the same case "
+                          "list must also match a splits.json (create_folds.py --ids-file).")
+    ap.add_argument("--limit", type=int, default=0,
+                     help="keep only the first N ids AFTER sorting/filtering (alphabetical — "
+                          "biased towards whichever subset letter sorts first; use --ids-file "
+                          "instead if the result must match a splits.json fold assignment)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
 
@@ -138,9 +196,14 @@ def main():
     print(f"[ids] resolved by name -> Left={left_id}  Right={right_id}", flush=True)
 
     cases, imgs, labs = pair_cases(a.src)
+    keep_letters = SUBSET_LETTERS[a.subset]
+    cases = [c for c in cases if subset_letter(c) in keep_letters]
+    if a.ids_file:
+        wanted = set(json.load(open(a.ids_file)))
+        cases = [c for c in cases if c in wanted]
     if a.limit:
         cases = cases[: a.limit]
-    print(f"[cases] {len(cases)} paired image/label cases", flush=True)
+    print(f"[cases] {len(cases)} paired image/label cases (subset={a.subset})", flush=True)
 
     os.makedirs(os.path.join(a.dst, "imagesTr"), exist_ok=True)
     os.makedirs(os.path.join(a.dst, "labelsTr"), exist_ok=True)

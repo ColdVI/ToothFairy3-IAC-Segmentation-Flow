@@ -69,9 +69,17 @@ def main():
     ap.add_argument("--out", default="configs/splits.json")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--ids-file", default=None,
+                     help="JSON list of case ids to restrict to (e.g. a FAST/smoke-test slice). "
+                          "Pass the SAME file to prepare_iac_dataset.py --ids-file so the raw "
+                          "nnU-Net dataset and this split describe exactly the same cases.")
     a = ap.parse_args()
 
     groups = scan_ids(a.src)
+    if a.ids_file:
+        wanted = set(json.load(open(a.ids_file)))
+        for k in groups:
+            groups[k] = [c for c in groups[k] if c in wanted]
     print(f"[ids] P={len(groups['P'])} F={len(groups['F'])} S={len(groups['S'])}")
     folds = stratified_folds(groups, a.folds, a.seed)
 

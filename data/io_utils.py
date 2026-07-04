@@ -38,6 +38,28 @@ def affines_match(a, b, tol=1e-3) -> bool:
     return np.allclose(np.asarray(a), np.asarray(b), atol=tol)
 
 
+def reorient_to_code(arr, affine, target_code="RPI"):
+    """
+    Reorient a volume to `target_code` (e.g. 'RPI') using the affine's direction
+    cosines — NOT a blind array flip. This reads which array axis/sign each
+    anatomical direction actually corresponds to (from the affine) and permutes
+    the array to match, updating the affine so every voxel keeps the same
+    physical (world) location. Left stays left, right stays right, as long as
+    the input affine is correct — unlike guessing from array index order.
+
+    Returns (reoriented_array, reoriented_affine).
+    """
+    from nibabel.orientations import (io_orientation, axcodes2ornt,
+                                       ornt_transform, apply_orientation, inv_ornt_aff)
+
+    current = io_orientation(affine)
+    target = axcodes2ornt(target_code)
+    transform = ornt_transform(current, target)
+    new_arr = apply_orientation(arr, transform)
+    new_affine = affine @ inv_ornt_aff(transform, arr.shape)
+    return new_arr, new_affine
+
+
 # --------------------------------------------------------------------------- #
 # Physical coordinates
 # --------------------------------------------------------------------------- #
