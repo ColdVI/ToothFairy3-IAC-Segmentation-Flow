@@ -34,6 +34,12 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 class nnUNetTrainerIAC_NoMirror(nnUNetTrainer):
     """Tüm eksenlerde mirroring augmentasyonunu kapatır."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Colab kopmalarına dayanıklılık: checkpoint_latest.pth'i daha SIK yaz
+        # (nnU-Net default 50). --c bundan devam eder; kopmada en fazla ~save_every epoch kaybı.
+        self.save_every = 25
+
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
         rotation, dummy, initial_patch, mirror_axes = \
             super().configure_rotation_dummyDA_mirroring_and_inital_patch_size()
@@ -49,6 +55,7 @@ class nnUNetTrainerIAC_NoMirror_50ep(nnUNetTrainerIAC_NoMirror):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_epochs = 50
+        self.save_every = 5      # kısa koşuda daha da sık checkpoint
 
 
 class nnUNetTrainerIAC_NoMirror_250ep(nnUNetTrainerIAC_NoMirror):
@@ -57,3 +64,4 @@ class nnUNetTrainerIAC_NoMirror_250ep(nnUNetTrainerIAC_NoMirror):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_epochs = 250
+        self.save_every = 10
