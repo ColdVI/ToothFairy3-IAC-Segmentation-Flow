@@ -21,6 +21,7 @@ have verified it against your plans.json. VERIFY the logged axis on first run.
 """
 import os
 
+import torch
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 # ToothFairy3 volumes are RPI: the first spatial axis (index 0) is the
@@ -58,6 +59,8 @@ class nnUNetTrainerIAC_NoLRMirror(nnUNetTrainer):
 
 
 class nnUNetTrainerIAC_NoLRMirror_50ep(nnUNetTrainerIAC_NoLRMirror):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    # Base ile birebir aynı imza (bkz. nnUNetTrainerIAC.py notu: *args/**kwargs KeyError verir).
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 50

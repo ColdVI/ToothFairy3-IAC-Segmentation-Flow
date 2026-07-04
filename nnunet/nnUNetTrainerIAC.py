@@ -28,14 +28,21 @@ KULLANIM:
     nnUNetv2_train 111 3d_fullres 0 -tr nnUNetTrainerIAC_NoMirror_50ep
 """
 
+import torch
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+
+# NOT: nnU-Net base __init__, my_init_kwargs'i signature(self.__init__) ile introspect
+# eder — bu yüzden varyant trainer'lar base ile BIREBIR AYNI __init__ imzasını korumak
+# ZORUNDA. `(*args, **kwargs)` ile override etmek "KeyError: 'args'" verir. Bu yüzden
+# aşağıda açık imza kullanılıyor (nnU-Net'in kendi nnUNetTrainer_Xepochs varyantları gibi).
 
 
 class nnUNetTrainerIAC_NoMirror(nnUNetTrainer):
     """Tüm eksenlerde mirroring augmentasyonunu kapatır."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
         # Colab kopmalarına dayanıklılık: checkpoint_latest.pth'i daha SIK yaz
         # (nnU-Net default 50). --c bundan devam eder; kopmada en fazla ~save_every epoch kaybı.
         self.save_every = 25
@@ -52,8 +59,9 @@ class nnUNetTrainerIAC_NoMirror(nnUNetTrainer):
 class nnUNetTrainerIAC_NoMirror_50ep(nnUNetTrainerIAC_NoMirror):
     """Colab'da hızlı deneme için 50 epoch (gerçek eğitim için kullanmayın)."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 50
         self.save_every = 5      # kısa koşuda daha da sık checkpoint
 
@@ -61,7 +69,8 @@ class nnUNetTrainerIAC_NoMirror_50ep(nnUNetTrainerIAC_NoMirror):
 class nnUNetTrainerIAC_NoMirror_250ep(nnUNetTrainerIAC_NoMirror):
     """Orta uzunlukta eğitim (kaynak kısıtlıysa iyi bir denge)."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 250
         self.save_every = 10
