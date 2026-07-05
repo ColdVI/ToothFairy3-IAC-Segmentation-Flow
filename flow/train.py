@@ -35,6 +35,40 @@ def load_yaml(path):
         return json.load(open(path))       # allow a JSON config as fallback
 
 
+def save_progress(out_dir, history):
+    """Write progress.csv + progress.png (val metrics vs epoch), like nnU-Net's plot.
+
+    History is the list of per-validation rows. The plot mirrors what we log to
+    stdout so a disconnected Colab run still leaves a visual training curve.
+    """
+    import csv
+    keys = ["epoch", "trainloss", "dice", "cldice", "hd95", "score"]
+    with open(os.path.join(out_dir, "progress.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys); w.writeheader(); w.writerows(history)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return                              # plotting is optional; CSV always written
+    ep = [h["epoch"] for h in history]
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.plot(ep, [h["dice"] for h in history], "-o", ms=3, color="#3f8cf2", label="val Dice")
+    ax1.plot(ep, [h["cldice"] for h in history], "-o", ms=3, color="#189f6f", label="val clDice")
+    ax1.plot(ep, [h["score"] for h in history], "-o", ms=3, color="#ed4c54",
+             label="score (0.5·Dice+0.5·clDice)")
+    ax1.set_xlabel("epoch"); ax1.set_ylabel("Dice / clDice / score")
+    ax1.set_ylim(0, 1); ax1.grid(alpha=.2)
+    ax2 = ax1.twinx()
+    ax2.plot(ep, [h["trainloss"] for h in history], "--", color="#9aa0a6", label="train loss")
+    ax2.plot(ep, [h["hd95"] for h in history], ":", color="#cf8a25", label="val HD95 (mm)")
+    ax2.set_ylabel("train loss / HD95 (mm)")
+    h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="lower right", fontsize=8, framealpha=.9)
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir, "progress.png"), dpi=120)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/flow.yaml")
@@ -70,7 +104,9 @@ def main():
 
     best = {"score": -1.0, "hd95": 1e9}
     start_epoch = 0
+    history = []
     last_path = os.path.join(a.out, "last.pt")
+    prog_csv = os.path.join(a.out, "progress.csv")
     if a.resume and os.path.isfile(last_path):
         ck = torch.load(last_path, map_location=dev)
         model.load_state_dict(ck["model"])
@@ -78,6 +114,10 @@ def main():
         sched.load_state_dict(ck["sched"])
         start_epoch = ck["epoch"] + 1
         best = ck["best"]
+        if os.path.isfile(prog_csv):        # keep the curve continuous across disconnects
+            import csv
+            history = [{k: (int(v) if k == "epoch" else float(v)) for k, v in row.items()}
+                       for row in csv.DictReader(open(prog_csv))]
         print(f"[resume] continuing from epoch {start_epoch} (best score {best['score']:.3f})")
 
     for ep in range(start_epoch, epochs):
@@ -115,6 +155,10 @@ def main():
             print(f"[ep {ep:4d}] trainloss {run/max(1,nb):.4f} | val Dice {m['dice']:.3f} "
                   f"clDice {m['cldice']:.3f} HD95 {m['hd95']:.2f} score {m['score']:.3f} "
                   f"{'*BEST*' if better else ''}  {time.time()-t0:.0f}s", flush=True)
+            history.append({"epoch": ep, "trainloss": run / max(1, nb),
+                            "dice": m["dice"], "cldice": m["cldice"],
+                            "hd95": m["hd95"], "score": m["score"]})
+            save_progress(a.out, history)   # progress.csv + progress.png every val step
     print("[train] done. best:", best, "->", os.path.join(a.out, "best.pt"))
 
 
