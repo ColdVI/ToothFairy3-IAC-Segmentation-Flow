@@ -138,12 +138,23 @@ def main():
             opt.step(); run += comp["total"]; nb += 1
         sched.step()
 
-        # resume checkpoint every epoch (cheap; optimizer+scheduler+epoch+best)
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                    "sched": sched.state_dict(), "epoch": ep, "best": best, "cfg": cfg},
-                   last_path)
+        # Persist the full optimizer/scheduler state at a fixed cadence. A reset can
+        # therefore lose at most checkpoint_every - 1 completed epochs.
+        checkpoint_due = (ep + 1) % cfg.get("checkpoint_every", 10) == 0 or ep == epochs - 1
+        if checkpoint_due:
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                        "sched": sched.state_dict(), "epoch": ep, "best": best, "cfg": cfg},
+                       last_path)
 
-        if ep % cfg.get("val_every", 25) == 0 or ep == epochs - 1:
+        wall_elapsed = time.monotonic() - wall_start
+        eta = wall_elapsed / max(ep + 1, 1) * (epochs - ep - 1)
+        is_val = ep % cfg.get("val_every", 25) == 0 or ep == epochs - 1
+        if not is_val:
+            print(f"[ep {ep + 1:4d}/{epochs}] trainloss {run/max(1,nb):.4f} | "
+                  f"epoch {time.time()-t0:.0f}s | wall {wall_elapsed / 60:.1f} min | "
+                  f"ETA {eta / 60:.1f} min | {'checkpoint saved' if checkpoint_due else 'running'}",
+                  flush=True)
+        if is_val:
             m = validate(model, val_ids, a.images, a.coarse_sdf, a.labels,
                          patch=cfg.get("patch", 96), steps=cfg.get("ode_steps", 8),
                          device=dev, max_cases=cfg.get("val_max_cases", 20))
@@ -153,8 +164,6 @@ def main():
                 best = m
                 torch.save({"model": model.state_dict(), "cfg": cfg, "val": m},
                            os.path.join(a.out, "best.pt"))
-            wall_elapsed = time.monotonic() - wall_start
-            eta = wall_elapsed / max(ep + 1, 1) * (epochs - ep - 1)
             print(f"[ep {ep:4d}] trainloss {run/max(1,nb):.4f} | val Dice {m['dice']:.3f} "
                   f"clDice {m['cldice']:.3f} HD95 {m['hd95']:.2f} score {m['score']:.3f} "
                   f"{'*BEST*' if better else ''} | {ep + 1}/{epochs} "

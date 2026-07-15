@@ -19,6 +19,7 @@ train_sigma: 0.1         # noise scale added to x0 during training
 noise_frac: 0.5          # fraction of batches that get noise (rest are sigma=0)
 
 # --- validation / checkpoint ---
+checkpoint_every: 10    # full resume checkpoint; reset loses at most 9 epochs
 val_every: 25
 val_max_cases: 20        # subsample val for speed during training
 # checkpoint score = 0.5*Dice + 0.5*clDice (ties -> lower HD95), set in validate.py
