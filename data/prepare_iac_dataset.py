@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -209,14 +210,22 @@ def main():
     os.makedirs(os.path.join(a.dst, "labelsTr"), exist_ok=True)
 
     jobs = [(sid, imgs[sid], labs[sid], a.dst, left_id, right_id, a.copy_images) for sid in cases]
-    kept, dropped = 0, []
+    kept, dropped, processed = 0, [], 0
+    started = time.monotonic()
 
     def record(sid, n_l, n_r, status):
-        nonlocal kept
+        nonlocal kept, processed
+        processed += 1
         if status == "ok":
             kept += 1
         else:
             dropped.append((sid, n_l, n_r, status))
+        if processed % 25 == 0 or processed == len(jobs):
+            elapsed = time.monotonic() - started
+            eta = elapsed / processed * (len(jobs) - processed)
+            print(f"[prepare] {processed}/{len(jobs)} ({100 * processed / len(jobs):.1f}%) | "
+                  f"kept {kept}, dropped {len(dropped)} | {elapsed / 60:.1f} min elapsed | "
+                  f"ETA {eta / 60:.1f} min", flush=True)
 
     use_pool = a.workers > 1
     if use_pool:
@@ -228,7 +237,8 @@ def main():
         except (PermissionError, OSError) as e:
             print(f"[warn] pool unavailable ({e}); serial fallback", flush=True)
             use_pool = False
-            kept, dropped = 0, []
+            kept, dropped, processed = 0, [], 0
+            started = time.monotonic()
     if not use_pool:
         for j in jobs:
             record(*convert_one(j))
