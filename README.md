@@ -84,6 +84,33 @@ python flow/selftest.py            # residual refinement machinery (coarse Dice 
 python tests/test_flow_shapes.py   # (and the other 4 test files)
 ```
 
+## Persistent Mac → Colab workflow
+
+Use `notebooks/prepare_drive_dataset.ipynb` once to create the canonical
+`configs/splits.json` and converted Dataset801 directly on Drive. Commit that
+exact split file: it is the common contract used by nnU-Net OOF and TrackB.
+
+Then run `notebooks/mac_local_oof_sdf.ipynb` on the M-series Mac. It performs
+OOF inference with `nnunet/predict_oof.py --device mps --resume` and computes
+both SDF caches directly in the Drive Desktop folder. Finally,
+`notebooks/colab_trackB_only.ipynb` copies those immutable inputs to Colab's
+local disk and spends GPU time only on `flow/train.py`.
+
+All three notebooks use this Drive layout beneath one shared `iac_runs` path:
+
+```
+dataset_cache/Dataset801_IAC_LR/{imagesTr,labelsTr}
+configs_cache/splits.json
+sdf_cache_backup/{oof_probs,gt_sdf,coarse_sdf}
+flow_fold<N>/{last.pt,best.pt,progress.csv,progress.png}
+```
+
+Before TrackB starts, `data/validate_pipeline_cache.py` checks split coverage,
+external-test isolation, required case files and readable cache archives. OOF
+inference has no stochastic TTA and is suitable for one-time caching; small
+floating-point differences between CUDA, CPU and MPS are nevertheless possible,
+so keep the device and `--step-size` fixed when comparing regenerated outputs.
+
 ## Domain rule
 
 **Sagittal left/right mirror augmentation must be OFF** (it swaps class 1↔2).
@@ -96,8 +123,9 @@ comparison is an explicit experiment. TTA mirroring is disabled at inference.
 - **Verified on CPU now:** residual selftest (coarse→refined Dice up), all 5 unit
   suites, evaluation metrics/topology, fold stratification, postprocessing, every
   module imports and the losses backprop.
-- **Needs the dataset + GPU:** nnU-Net training/OOF, SDF caching over 480 volumes,
-  full flow training and the CV/external reports. Those scripts are complete but
+- **Needs the dataset:** OOF inference and SDF caching over 480 volumes. OOF can
+  run on MPS/CPU and SDF is CPU-only; full flow training and CV/external reports
+  remain data/GPU-dependent. Those scripts are complete but
   are exercised by import + unit tests, not end-to-end here.
 
 ## References

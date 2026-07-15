@@ -107,6 +107,7 @@ def main():
     history = []
     last_path = os.path.join(a.out, "last.pt")
     prog_csv = os.path.join(a.out, "progress.csv")
+    wall_start = time.monotonic()
     if a.resume and os.path.isfile(last_path):
         ck = torch.load(last_path, map_location=dev)
         model.load_state_dict(ck["model"])
@@ -152,9 +153,13 @@ def main():
                 best = m
                 torch.save({"model": model.state_dict(), "cfg": cfg, "val": m},
                            os.path.join(a.out, "best.pt"))
+            wall_elapsed = time.monotonic() - wall_start
+            eta = wall_elapsed / max(ep + 1, 1) * (epochs - ep - 1)
             print(f"[ep {ep:4d}] trainloss {run/max(1,nb):.4f} | val Dice {m['dice']:.3f} "
                   f"clDice {m['cldice']:.3f} HD95 {m['hd95']:.2f} score {m['score']:.3f} "
-                  f"{'*BEST*' if better else ''}  {time.time()-t0:.0f}s", flush=True)
+                  f"{'*BEST*' if better else ''} | {ep + 1}/{epochs} "
+                  f"({100 * (ep + 1) / epochs:.1f}%) | epoch {time.time()-t0:.0f}s | "
+                  f"wall {wall_elapsed / 60:.1f} min | ETA {eta / 60:.1f} min", flush=True)
             history.append({"epoch": ep, "trainloss": run / max(1, nb),
                             "dice": m["dice"], "cldice": m["cldice"],
                             "hd95": m["hd95"], "score": m["score"]})
