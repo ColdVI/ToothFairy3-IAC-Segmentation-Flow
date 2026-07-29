@@ -42,9 +42,16 @@ def save_progress(out_dir, history):
     stdout so a disconnected Colab run still leaves a visual training curve.
     """
     import csv
-    keys = ["epoch", "trainloss", "dice", "cldice", "hd95", "score"]
-    with open(os.path.join(out_dir, "progress.csv"), "w", newline="") as f:
+    preferred = ["epoch", "trainloss", "fm", "narrowband", "cldice_loss",
+                 "laterality", "tv", "total", "dice", "cldice", "hd95", "score"]
+    present = {key for row in history for key in row}
+    keys = [key for key in preferred if key in present]
+    keys.extend(sorted(present.difference(keys)))
+    progress_path = os.path.join(out_dir, "progress.csv")
+    partial_path = progress_path + ".partial"
+    with open(partial_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys); w.writeheader(); w.writerows(history)
+    os.replace(partial_path, progress_path)
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -52,19 +59,33 @@ def save_progress(out_dir, history):
     except Exception:
         return                              # plotting is optional; CSV always written
     ep = [h["epoch"] for h in history]
-    fig, ax1 = plt.subplots(figsize=(9, 5))
+    fig, (ax1, ax_loss) = plt.subplots(2, 1, figsize=(9, 8), sharex=True,
+                                      gridspec_kw={"height_ratios": [2, 1]})
     ax1.plot(ep, [h["dice"] for h in history], "-o", ms=3, color="#3f8cf2", label="val Dice")
     ax1.plot(ep, [h["cldice"] for h in history], "-o", ms=3, color="#189f6f", label="val clDice")
     ax1.plot(ep, [h["score"] for h in history], "-o", ms=3, color="#ed4c54",
              label="score (0.5·Dice+0.5·clDice)")
-    ax1.set_xlabel("epoch"); ax1.set_ylabel("Dice / clDice / score")
+    ax1.set_ylabel("Dice / clDice / score")
     ax1.set_ylim(0, 1); ax1.grid(alpha=.2)
     ax2 = ax1.twinx()
-    ax2.plot(ep, [h["trainloss"] for h in history], "--", color="#9aa0a6", label="train loss")
     ax2.plot(ep, [h["hd95"] for h in history], ":", color="#cf8a25", label="val HD95 (mm)")
-    ax2.set_ylabel("train loss / HD95 (mm)")
+    ax2.set_ylabel("HD95 (mm)")
     h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
     ax1.legend(h1 + h2, l1 + l2, loc="lower right", fontsize=8, framealpha=.9)
+    loss_styles = {
+        "fm": ("#0072B2", "FM"),
+        "narrowband": ("#E69F00", "narrow-band"),
+        "cldice_loss": ("#009E73", "soft-clDice"),
+        "laterality": ("#CC79A7", "laterality"),
+        "tv": ("#56B4E9", "TV"),
+        "total": ("#000000", "total"),
+    }
+    for key, (colour, label) in loss_styles.items():
+        if any(key in h for h in history):
+            ax_loss.plot(ep, [h.get(key, np.nan) for h in history], "-o", ms=2,
+                         color=colour, label=label)
+    ax_loss.set_xlabel("epoch"); ax_loss.set_ylabel("training loss")
+    ax_loss.grid(alpha=.2); ax_loss.legend(loc="best", fontsize=8, ncol=3)
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, "progress.png"), dpi=120)
     plt.close(fig)
 
@@ -123,6 +144,8 @@ def main():
 
     for ep in range(start_epoch, epochs):
         model.train(); t0 = time.time(); run = 0.0; nb = 0
+        component_sums = {key: 0.0 for key in
+                          ("fm", "narrowband", "cldice", "laterality", "tv", "total")}
         for cond, x0, x1 in dl:
             cond, x0, x1 = cond.to(dev), x0.to(dev), x1.to(dev)
             # noise schedule: some batches deterministic (sigma=0) so inference matches
@@ -136,6 +159,8 @@ def main():
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); run += comp["total"]; nb += 1
+            for key in component_sums:
+                component_sums[key] += comp.get(key, 0.0)
         sched.step()
 
         # Persist the full optimizer/scheduler state at a fixed cadence. A reset can
@@ -169,7 +194,15 @@ def main():
                   f"{'*BEST*' if better else ''} | {ep + 1}/{epochs} "
                   f"({100 * (ep + 1) / epochs:.1f}%) | epoch {time.time()-t0:.0f}s | "
                   f"wall {wall_elapsed / 60:.1f} min | ETA {eta / 60:.1f} min", flush=True)
+            component_means = {key: value / max(1, nb)
+                               for key, value in component_sums.items()}
             history.append({"epoch": ep, "trainloss": run / max(1, nb),
+                            "fm": component_means["fm"],
+                            "narrowband": component_means["narrowband"],
+                            "cldice_loss": component_means["cldice"],
+                            "laterality": component_means["laterality"],
+                            "tv": component_means["tv"],
+                            "total": component_means["total"],
                             "dice": m["dice"], "cldice": m["cldice"],
                             "hd95": m["hd95"], "score": m["score"]})
             save_progress(a.out, history)   # progress.csv + progress.png every val step
