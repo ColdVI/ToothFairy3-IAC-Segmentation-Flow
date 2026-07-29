@@ -10,8 +10,10 @@ select best.pt by S_val = 0.5*Dice + 0.5*clDice. Training loss is logged for
 monitoring only; it never drives checkpoint selection.
 """
 import argparse
+import atexit
 import json
 import os
+import random
 import sys
 import time
 
@@ -25,6 +27,8 @@ from model import ResidualVelocityUNet3D, COND_CH        # noqa: E402
 from losses import total_loss                            # noqa: E402
 from datasets import IACFlowDataset                      # noqa: E402
 from validate import validate                            # noqa: E402
+from scripts.run_manifest import (default_run_dir, finish_manifest,             # noqa: E402
+                                  start_manifest)
 
 
 PRIOR_METRICS = ("dice", "cldice", "hd95", "score")
@@ -118,6 +122,13 @@ def checkpoint_is_better(metrics, best, prior_floor, tolerance=1e-5):
         and metrics["hd95"] < best["hd95"])
 
 
+def atomic_torch_save(payload, path):
+    """Keep the previous checkpoint valid if a session dies during serialization."""
+    partial = path + ".partial"
+    torch.save(payload, partial)
+    os.replace(partial, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/flow.yaml")
@@ -127,18 +138,37 @@ def main():
     ap.add_argument("--labels", required=True, help="Dataset801_IAC_LR/labelsTr")
     ap.add_argument("--gt-sdf", required=True)
     ap.add_argument("--coarse-sdf", required=True)
-    ap.add_argument("--out", default="outputs/flow_fold0")
+    ap.add_argument("--out", default=None,
+                    help="explicit legacy output directory (default: runs/<config_hash>)")
+    ap.add_argument("--runs-root", default="runs")
+    ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--resume", action="store_true",
                     help="continue from outputs/.../last.pt if present (survives Colab disconnects)")
     a = ap.parse_args()
 
     cfg = load_yaml(a.config)
     prior_floor = require_prior_floor(cfg)
+    seed = int(cfg.get("seed", 0) if a.seed is None else a.seed)
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     splits = json.load(open(a.splits))
     fold = splits["folds"][a.fold]
     train_ids, val_ids = fold["train"], fold["val"]
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if a.out is None:
+        a.out = default_run_dir(a.runs_root, cfg, a.fold, seed)
     os.makedirs(a.out, exist_ok=True)
+    start_manifest(a.out, cfg, a.fold, seed,
+                   os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
+                   resume=a.resume)
+    manifest_finished = False
+
+    def mark_interrupted():
+        if not manifest_finished:
+            finish_manifest(a.out, "interrupted")
+
+    atexit.register(mark_interrupted)
     print(f"[train] fold {a.fold}: {len(train_ids)} train / {len(val_ids)} val  device={dev}")
 
     ds = IACFlowDataset(train_ids, a.images, a.gt_sdf, a.coarse_sdf,
@@ -195,14 +225,7 @@ def main():
                 component_sums[key] += comp.get(key, 0.0)
         sched.step()
 
-        # Persist the full optimizer/scheduler state at a fixed cadence. A reset can
-        # therefore lose at most checkpoint_every - 1 completed epochs.
         checkpoint_due = (ep + 1) % cfg.get("checkpoint_every", 10) == 0 or ep == epochs - 1
-        if checkpoint_due:
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                        "sched": sched.state_dict(), "epoch": ep, "best": best, "cfg": cfg},
-                       last_path)
-
         wall_elapsed = time.monotonic() - wall_start
         eta = wall_elapsed / max(ep + 1, 1) * (epochs - ep - 1)
         is_val = ep % cfg.get("val_every", 25) == 0 or ep == epochs - 1
@@ -218,8 +241,9 @@ def main():
             better = checkpoint_is_better(m, best, prior_floor)
             if better:
                 best = m
-                torch.save({"model": model.state_dict(), "cfg": cfg, "val": m},
-                           os.path.join(a.out, "best.pt"))
+                atomic_torch_save({"model": model.state_dict(), "cfg": cfg, "val": m,
+                                   "fold": a.fold, "seed": seed},
+                                  os.path.join(a.out, "best.pt"))
             print(f"[ep {ep:4d}] trainloss {run/max(1,nb):.4f} | val Dice {m['dice']:.3f} "
                   f"clDice {m['cldice']:.3f} HD95 {m['hd95']:.2f} score {m['score']:.3f} "
                   f"{'*BEST*' if better else ''} | {ep + 1}/{epochs} "
@@ -237,9 +261,19 @@ def main():
                             "dice": m["dice"], "cldice": m["cldice"],
                             "hd95": m["hd95"], "score": m["score"]})
             save_progress(a.out, history)   # progress.csv + progress.png every val step
+
+        # Save after validation so the resume checkpoint carries the current
+        # best-gate state rather than lagging one validation behind.
+        if checkpoint_due:
+            atomic_torch_save({"model": model.state_dict(), "opt": opt.state_dict(),
+                               "sched": sched.state_dict(), "epoch": ep, "best": best,
+                               "cfg": cfg, "fold": a.fold, "seed": seed}, last_path)
     best_path = os.path.join(a.out, "best.pt")
     print("[train] done. best:", best, "->", best_path if os.path.isfile(best_path)
           else "no checkpoint beat the identity prior")
+    finish_manifest(a.out, "completed", {**best, "checkpoint_written": os.path.isfile(best_path)})
+    manifest_finished = True
+    atexit.unregister(mark_interrupted)
 
 
 if __name__ == "__main__":
