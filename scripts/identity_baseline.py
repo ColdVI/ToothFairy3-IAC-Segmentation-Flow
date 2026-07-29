@@ -58,6 +58,30 @@ def _write_prior_floor(config_path: Path, metrics):
     os.replace(partial, config_path)
 
 
+def write_config_from_report(report_path: Path, config_path: Path):
+    """Write a prior only from the completed three-path, 480-case report."""
+    payload = json.loads(Path(report_path).read_text())
+    required = {
+        "complete_cv": payload.get("complete_cv") is True,
+        "evaluated_cases": payload.get("evaluated_cases") == 480,
+        "cache_valid_cases": payload.get("cache_valid_cases") == 480,
+        "missing_cases": payload.get("missing_cases") == 0,
+        "invalid_cases": payload.get("invalid_cases") == 0,
+        "direct_vs_sdf": payload.get("direct_vs_sdf_voxel_difference") == 0,
+        "direct_vs_full": payload.get("direct_vs_full_path_voxel_difference") == 0,
+    }
+    failed = [name for name, valid in required.items() if not valid]
+    if failed:
+        raise ValueError(f"refusing prior_floor from incomplete identity report: {failed}")
+    metrics = payload.get("overall", {}).get("per_side", {}).get("direct")
+    if not metrics or any(metrics.get(name) is None for name in ("dice", "cldice", "hd95")):
+        raise ValueError("identity report lacks finite direct per-side metrics")
+    metrics = dict(metrics)
+    metrics["score"] = 0.5 * metrics["dice"] + 0.5 * metrics["cldice"]
+    _write_prior_floor(Path(config_path), metrics)
+    return metrics
+
+
 def _ordered_validation_ids(splits):
     ids = [sid for fold in splits["folds"] for sid in fold["val"]]
     duplicates = sorted(sid for sid, count in Counter(ids).items() if count != 1)
@@ -96,9 +120,9 @@ def _subset_rows(rows, ids):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--splits", default="configs/splits.json")
-    parser.add_argument("--images", required=True)
-    parser.add_argument("--labels", required=True)
-    parser.add_argument("--coarse-sdf", required=True)
+    parser.add_argument("--images")
+    parser.add_argument("--labels")
+    parser.add_argument("--coarse-sdf")
     parser.add_argument("--out", default="outputs/baselines/identity_prior.json")
     parser.add_argument("--config", default="configs/flow.yaml")
     parser.add_argument("--write-config", action="store_true",
@@ -109,7 +133,19 @@ def main():
     parser.add_argument("--clip-mm", type=float, default=10.0)
     parser.add_argument("--allow-incomplete", action="store_true",
                         help="diagnostic only: evaluate the cache intersection and mark output incomplete")
+    parser.add_argument("--write-config-from-report", default=None,
+                        help="validate a completed three-path report and write its direct prior")
     args = parser.parse_args()
+
+    if args.write_config_from_report:
+        if not args.write_config:
+            parser.error("--write-config-from-report requires --write-config")
+        metrics = write_config_from_report(Path(args.write_config_from_report), Path(args.config))
+        print(f"[identity] verified full report and wrote prior_floor -> {args.config}")
+        print(json.dumps(metrics, indent=2))
+        return
+    if not all((args.images, args.labels, args.coarse_sdf)):
+        parser.error("--images, --labels, and --coarse-sdf are required for inference")
 
     with open(args.splits) as handle:
         splits = json.load(handle)

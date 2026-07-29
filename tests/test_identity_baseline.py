@@ -2,7 +2,8 @@ import pytest
 
 import _pathsetup  # noqa: F401
 from flow.validate import summarize_rows
-from scripts.identity_baseline import _ordered_validation_ids
+from scripts.identity_baseline import (_ordered_validation_ids,
+                                       write_config_from_report)
 
 
 def test_summarize_rows_reports_both_aggregation_modes():
@@ -32,3 +33,28 @@ def test_validation_fold_union_must_match_development():
                   "folds": [{"val": ["a"]}, {"val": ["a"]}]}
     with pytest.raises(ValueError, match="not disjoint"):
         _ordered_validation_ids(duplicated)
+
+
+def test_prior_config_requires_completed_three_path_report(tmp_path):
+    config = tmp_path / "flow.yaml"
+    config.write_text("prior_floor:\n  complete_cv: null\n  dice: null\nnoninferiority_margin: null\n")
+    report = tmp_path / "identity.json"
+    full = {
+        "complete_cv": True, "evaluated_cases": 480, "cache_valid_cases": 480,
+        "missing_cases": 0, "invalid_cases": 0,
+        "direct_vs_sdf_voxel_difference": 0,
+        "direct_vs_full_path_voxel_difference": 0,
+        "overall": {"per_side": {"direct": {
+            "dice": .8, "cldice": .9, "hd95": 2.0}}},
+    }
+    report.write_text(__import__("json").dumps(full))
+    metrics = write_config_from_report(report, config)
+    assert metrics["score"] == pytest.approx(.85)
+    text = config.read_text()
+    assert "complete_cv: true" in text
+    assert "noninferiority_margin: null" in text
+
+    full["evaluated_cases"] = 40
+    report.write_text(__import__("json").dumps(full))
+    with pytest.raises(ValueError, match="incomplete identity report"):
+        write_config_from_report(report, config)

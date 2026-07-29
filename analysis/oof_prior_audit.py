@@ -129,8 +129,10 @@ def _safe_corr(a, b, max_sample=250_000):
     if a.size > max_sample:
         indices = np.linspace(0, a.size - 1, max_sample, dtype=np.int64)
         a, b = a[indices], b[indices]
-    a = a.astype(np.float64); b = b.astype(np.float64)
-    a -= a.mean(); b -= b.mean()
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+    a -= a.mean()
+    b -= b.mean()
     denominator = math.sqrt(float(np.dot(a, a) * np.dot(b, b)))
     return None if denominator == 0 else float(np.dot(a, b) / denominator)
 
@@ -159,8 +161,10 @@ def probability_stats(probs):
 
 
 def _geometry(image_path, label_path):
-    image = nib.load(str(image_path)); label = nib.load(str(label_path))
-    image_spacing = voxel_spacing(image); label_spacing = voxel_spacing(label)
+    image = nib.load(str(image_path))
+    label = nib.load(str(label_path))
+    image_spacing = voxel_spacing(image)
+    label_spacing = voxel_spacing(label)
     return {
         "shape": list(label.shape),
         "image_shape": list(image.shape),
@@ -312,7 +316,8 @@ def write_reports(prefix, cases, legacy_adapter):
     csv_rows = [_flatten_for_csv(row) for row in cases]
     with csv_partial.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(csv_rows[0]))
-        writer.writeheader(); writer.writerows(csv_rows)
+        writer.writeheader()
+        writer.writerows(csv_rows)
     os.replace(csv_partial, csv_path)
     atomic_json(json_path, {"summary": summary, "cases": cases})
     invalid = [row["case_id"] for row in cases if row["status"] != "valid"]
@@ -348,12 +353,18 @@ def main():
     parser.add_argument("--state", default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-cases", type=int, default=None)
+    parser.add_argument("--case-ids", default=None,
+                        help="optional JSON list selecting an explicit audited cohort")
     args = parser.parse_args()
 
     with open(args.splits) as handle:
         splits = json.load(handle)
     fold_map = expected_fold_map(splits)
-    case_ids = list(splits["development"])
+    case_ids = (json.loads(Path(args.case_ids).read_text()) if args.case_ids
+                else list(splits["development"]))
+    unknown = sorted(set(case_ids) - set(splits["development"]))
+    if unknown:
+        raise ValueError(f"audit case list contains non-development IDs: {unknown[:5]}")
     if args.max_cases is not None:
         case_ids = case_ids[:args.max_cases]
     provenance = {}
