@@ -38,23 +38,53 @@ def _load_case(sid, images_dir, coarse_sdf_dir):
     return cond, coarse_sdf, sp
 
 
-def validate(model, val_ids, images_dir, coarse_sdf_dir, gt_labels_dir,
-             patch=96, steps=8, device="cpu", max_cases=None):
+def validation_rows(model, val_ids, images_dir, coarse_sdf_dir, gt_labels_dir,
+                    patch=96, steps=8, device="cpu", max_cases=None,
+                    progress=False):
+    """Run inference and return one metric row per case and anatomical side."""
     model.eval()
     ids = val_ids if max_cases is None else val_ids[:max_cases]
     rows = []
-    for sid in ids:
+    for case_index, sid in enumerate(ids, start=1):
         cond, coarse_sdf, sp = _load_case(sid, images_dir, coarse_sdf_dir)
         endp = predict_volume(model, cond, coarse_sdf, patch=patch, steps=steps, device=device)
         pred = sdf_stack_to_mask(endp)
         gt = np.asanyarray(nib.load(os.path.join(gt_labels_dir, f"{sid}.nii.gz")).dataobj)
         for side in (1, 2):
-            rows.append((dice(pred == side, gt == side),
-                         cldice(pred == side, gt == side),
-                         hd95(pred == side, gt == side, sp)))
-    arr = np.array(rows, dtype=np.float64)
-    mean_dice = float(np.nanmean(arr[:, 0]))
-    mean_cldice = float(np.nanmean(arr[:, 1]))
-    mean_hd95 = float(np.nanmean(arr[:, 2]))
+            rows.append({"case_id": sid, "side": side,
+                         "dice": dice(pred == side, gt == side),
+                         "cldice": cldice(pred == side, gt == side),
+                         "hd95": hd95(pred == side, gt == side, sp)})
+        if progress:
+            print(f"[validate] {case_index}/{len(ids)} {sid}", flush=True)
+    return rows
+
+
+def summarize_rows(rows, aggregation="per_side"):
+    """Aggregate validation rows either directly or after bilateral case means."""
+    if not rows:
+        raise ValueError("cannot summarize an empty validation result")
+    metrics = ("dice", "cldice", "hd95")
+    if aggregation == "per_side":
+        values = {metric: [row[metric] for row in rows] for metric in metrics}
+    elif aggregation == "per_case":
+        case_ids = list(dict.fromkeys(row["case_id"] for row in rows))
+        values = {metric: [] for metric in metrics}
+        for sid in case_ids:
+            case_rows = [row for row in rows if row["case_id"] == sid]
+            for metric in metrics:
+                values[metric].append(float(np.nanmean([row[metric] for row in case_rows])))
+    else:
+        raise ValueError(f"unknown aggregation: {aggregation}")
+    mean_dice = float(np.nanmean(values["dice"]))
+    mean_cldice = float(np.nanmean(values["cldice"]))
+    mean_hd95 = float(np.nanmean(values["hd95"]))
     score = 0.5 * mean_dice + 0.5 * mean_cldice
     return {"dice": mean_dice, "cldice": mean_cldice, "hd95": mean_hd95, "score": score}
+
+
+def validate(model, val_ids, images_dir, coarse_sdf_dir, gt_labels_dir,
+             patch=96, steps=8, device="cpu", max_cases=None):
+    rows = validation_rows(model, val_ids, images_dir, coarse_sdf_dir, gt_labels_dir,
+                           patch=patch, steps=steps, device=device, max_cases=max_cases)
+    return summarize_rows(rows, aggregation="per_side")

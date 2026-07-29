@@ -71,11 +71,15 @@ def physical_coord_grid(shape, affine) -> np.ndarray:
     voxel, computed through the NIfTI affine (NOT array indices). This is what
     the flow model consumes as its laterality-aware positional conditioning.
     """
-    d, h, w = shape
-    ii, jj, kk = np.meshgrid(np.arange(d), np.arange(h), np.arange(w), indexing="ij")
-    idx = np.stack([ii, jj, kk, np.ones_like(ii)], axis=0).reshape(4, -1).astype(np.float64)
-    world = affine @ idx                      # (4, N)
-    return world[:3].reshape(3, d, h, w)
+    # Compute the three world channels directly. Besides avoiding a large
+    # temporary homogeneous-coordinate matrix, this sidesteps Accelerate/BLAS
+    # matmul warnings observed for both tiny test arrays and full CBCT volumes.
+    indices = np.indices(shape, dtype=np.float64)
+    linear = np.asarray(affine, dtype=np.float64)[:3, :3]
+    translation = np.asarray(affine, dtype=np.float64)[:3, 3]
+    world = np.einsum("ij,j...->i...", linear, indices, optimize=False)
+    world += translation[:, None, None, None]
+    return world
 
 
 def normalize_coords(coords: np.ndarray) -> np.ndarray:
