@@ -7,10 +7,14 @@ from scripts.identity_baseline import _ordered_validation_ids
 
 def test_summarize_rows_reports_both_aggregation_modes():
     rows = [
-        {"case_id": "a", "side": 1, "dice": 0.5, "cldice": 0.7, "hd95": 2.0},
-        {"case_id": "a", "side": 2, "dice": 0.9, "cldice": 0.9, "hd95": 4.0},
-        {"case_id": "b", "side": 1, "dice": 0.7, "cldice": 0.8, "hd95": 1.0},
-        {"case_id": "b", "side": 2, "dice": 0.3, "cldice": 0.6, "hd95": 3.0},
+        {"case_id": "a", "side": 1, "dice": 0.5, "cldice": 0.7, "hd95": 2.0,
+         "gap_mm": 1.0, "betti0": 0.0},
+        {"case_id": "a", "side": 2, "dice": 0.9, "cldice": 0.9, "hd95": 4.0,
+         "gap_mm": 3.0, "betti0": 2.0},
+        {"case_id": "b", "side": 1, "dice": 0.7, "cldice": 0.8, "hd95": 1.0,
+         "gap_mm": 2.0, "betti0": 1.0},
+        {"case_id": "b", "side": 2, "dice": 0.3, "cldice": 0.6, "hd95": 3.0,
+         "gap_mm": 4.0, "betti0": 1.0},
     ]
     side = summarize_rows(rows, "per_side")
     case = summarize_rows(rows, "per_case")

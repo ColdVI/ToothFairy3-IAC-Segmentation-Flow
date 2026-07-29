@@ -51,7 +51,7 @@ def _write_prior_floor(config_path: Path, metrics):
     end = start + 1
     while end < len(lines) and (lines[end].startswith(" ") or not lines[end].strip()):
         end += 1
-    block = ["prior_floor:\n"] + [f"  {key}: {metrics[key]:.10g}\n"
+    block = ["prior_floor:\n", "  complete_cv: true\n"] + [f"  {key}: {metrics[key]:.10g}\n"
                                     for key in ("dice", "cldice", "hd95", "score")]
     partial = config_path.with_suffix(config_path.suffix + ".partial")
     partial.write_text("".join(lines[:start] + block + lines[end:]))

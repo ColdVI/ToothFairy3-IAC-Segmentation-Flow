@@ -6,12 +6,14 @@ train.py — residual flow training with leakage-free data and real validation.
 
 Reads a fold from configs/splits.json, trains the residual velocity field on
 OOF-derived coarse priors, and every `val_every` epochs runs validate() to
-select best.pt by S_val = 0.5*Dice + 0.5*clDice. Training loss is logged for
-monitoring only; it never drives checkpoint selection.
+write three distinct checkpoints: last.pt for resume, best_any.pt for debugging,
+and best_safe.pt only after a predeclared Dice non-inferiority gate. Training
+loss is logged for monitoring only; it never drives checkpoint selection.
 """
 import argparse
 import atexit
 import json
+import math
 import os
 import random
 import sys
@@ -50,7 +52,8 @@ def save_progress(out_dir, history):
     """
     import csv
     preferred = ["epoch", "trainloss", "fm", "narrowband", "cldice_loss",
-                 "laterality", "tv", "total", "dice", "cldice", "hd95", "score"]
+                 "laterality", "tv", "total", "dice", "cldice", "hd95",
+                 "gap_mm", "betti0", "safe_eligible", "score"]
     present = {key for row in history for key in row}
     keys = [key for key in preferred if key in present]
     keys.extend(sorted(present.difference(keys)))
@@ -102,6 +105,8 @@ def require_prior_floor(cfg):
     floor = cfg.get("prior_floor")
     if not isinstance(floor, dict):
         raise ValueError("config prior_floor is missing; run identity_baseline.py --write-config")
+    if floor.get("complete_cv") is not True:
+        raise ValueError("config prior_floor is partial; complete_cv must be true")
     missing = [key for key in PRIOR_METRICS
                if not isinstance(floor.get(key), (int, float))]
     if missing:
@@ -113,13 +118,58 @@ def require_prior_floor(cfg):
     return {key: float(floor[key]) for key in PRIOR_METRICS}
 
 
-def checkpoint_is_better(metrics, best, prior_floor, tolerance=1e-5):
-    """A candidate is eligible only after it strictly beats the measured prior."""
-    if metrics["score"] <= prior_floor["score"] + tolerance:
+def require_noninferiority_margin(cfg):
+    margin = cfg.get("noninferiority_margin")
+    if not isinstance(margin, (int, float)):
+        raise ValueError("config noninferiority_margin is null; it requires an explicit "
+                         "user decision after full-CV identity and before any B-run")
+    if not 0 <= margin <= 1:
+        raise ValueError(f"invalid noninferiority_margin: {margin}")
+    return float(margin)
+
+
+def is_safe(metrics, prior_floor, margin, tolerance=1e-8):
+    dice_value = float(metrics["dice"])
+    return math.isfinite(dice_value) and dice_value + tolerance >= prior_floor["dice"] - margin
+
+
+def _finite(value, fallback):
+    value = float(value)
+    return value if math.isfinite(value) else fallback
+
+
+def _selection_key(metrics, epoch, prior_floor, margin):
+    """Higher tuple is better; Dice is an eligibility gate, not a weighted score."""
+    required = ("dice", "gap_mm", "betti0", "hd95", "cldice")
+    missing = [key for key in required if key not in metrics]
+    if missing:
+        raise ValueError(f"validation metrics missing selection fields: {missing}")
+    return (int(is_safe(metrics, prior_floor, margin)),
+            -_finite(metrics["gap_mm"], math.inf),
+            -_finite(metrics["betti0"], math.inf),
+            -_finite(metrics["hd95"], math.inf),
+            _finite(metrics["cldice"], -math.inf), -int(epoch))
+
+
+def checkpoint_is_better(metrics, epoch, best, prior_floor, margin, require_safe=False):
+    """Lexicographic selection shared by best-any and best-safe checkpoints."""
+    if require_safe and not is_safe(metrics, prior_floor, margin):
         return False
-    return (metrics["score"] > best["score"] + tolerance) or (
-        abs(metrics["score"] - best["score"]) <= tolerance
-        and metrics["hd95"] < best["hd95"])
+    if best is None:
+        return True
+    return _selection_key(metrics, epoch, prior_floor, margin) > _selection_key(
+        best, best["epoch"], prior_floor, margin)
+
+
+def update_checkpoint_selection(metrics, epoch, best_any, best_safe, prior_floor, margin):
+    record = {**metrics, "epoch": int(epoch),
+              "safe_eligible": is_safe(metrics, prior_floor, margin)}
+    write_any = checkpoint_is_better(metrics, epoch, best_any, prior_floor, margin)
+    write_safe = checkpoint_is_better(metrics, epoch, best_safe, prior_floor, margin,
+                                      require_safe=True)
+    return (record if write_any else best_any,
+            record if write_safe else best_safe,
+            write_any, write_safe)
 
 
 def atomic_torch_save(payload, path):
@@ -127,6 +177,32 @@ def atomic_torch_save(payload, path):
     partial = path + ".partial"
     torch.save(payload, partial)
     os.replace(partial, path)
+
+
+def migrate_legacy_best(out_dir, map_location="cpu"):
+    """Copy legacy best.pt into the new names once; keep the legacy file untouched."""
+    legacy_path = os.path.join(out_dir, "best.pt")
+    any_path = os.path.join(out_dir, "best_any.pt")
+    safe_path = os.path.join(out_dir, "best_safe.pt")
+    if not os.path.isfile(legacy_path) or os.path.isfile(any_path):
+        return None, None
+    checkpoint = torch.load(legacy_path, map_location=map_location, weights_only=False)
+    metrics = checkpoint.get("val")
+    if not isinstance(metrics, dict):
+        raise ValueError(f"legacy checkpoint has no validation metrics: {legacy_path}")
+    missing = [key for key in ("dice", "cldice", "hd95") if key not in metrics]
+    if missing:
+        raise ValueError(f"legacy validation metrics incomplete ({missing}): {legacy_path}")
+    # Legacy checkpoints predate topology-aware selection. Preserve them for
+    # debugging, but do not infer missing gap/Betti values or call them safe.
+    epoch = int(checkpoint.get("epoch", metrics.get("epoch", -1)))
+    record = {**metrics, "epoch": epoch, "safe_eligible": False,
+              "legacy_missing_topology": True}
+    migrated = {**checkpoint, "val": record, "migration_source": "best.pt"}
+    atomic_torch_save(migrated, any_path)
+    # Even if Dice happens to pass, best_safe is intentionally not created:
+    # its topology rank and predeclared policy were absent in the legacy run.
+    return record, None
 
 
 def main():
@@ -148,6 +224,7 @@ def main():
 
     cfg = load_yaml(a.config)
     prior_floor = require_prior_floor(cfg)
+    noninferiority_margin = require_noninferiority_margin(cfg)
     seed = int(cfg.get("seed", 0) if a.seed is None else a.seed)
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -182,27 +259,40 @@ def main():
     epochs = cfg.get("epochs", 500)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
 
-    best = dict(prior_floor)
+    best_any = None
+    best_safe = None
     start_epoch = 0
     history = []
     last_path = os.path.join(a.out, "last.pt")
+    best_any_path = os.path.join(a.out, "best_any.pt")
+    best_safe_path = os.path.join(a.out, "best_safe.pt")
     prog_csv = os.path.join(a.out, "progress.csv")
     wall_start = time.monotonic()
     print(f"[train] identity prior floor: score={prior_floor['score']:.4f} "
           f"Dice={prior_floor['dice']:.4f} clDice={prior_floor['cldice']:.4f} "
           f"HD95={prior_floor['hd95']:.3f} mm")
+    print(f"[train] Dice non-inferiority margin: {noninferiority_margin:.6f}")
+    if a.resume:
+        migrated_any, _ = migrate_legacy_best(a.out, map_location=dev)
+        if migrated_any is not None:
+            print("[resume] preserved legacy best.pt as best_any.pt; it is not safe-eligible "
+                  "because legacy topology ranks are unavailable")
     if a.resume and os.path.isfile(last_path):
-        ck = torch.load(last_path, map_location=dev)
+        ck = torch.load(last_path, map_location=dev, weights_only=False)
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         start_epoch = ck["epoch"] + 1
-        best = ck["best"]
+        best_any = ck.get("best_any")
+        best_safe = ck.get("best_safe")
+        if "best" in ck and best_any is None:
+            print("[resume] legacy last.pt best metadata ignored for new topology-aware ranking")
         if os.path.isfile(prog_csv):        # keep the curve continuous across disconnects
             import csv
             history = [{k: (int(v) if k == "epoch" else float(v)) for k, v in row.items()}
                        for row in csv.DictReader(open(prog_csv))]
-        print(f"[resume] continuing from epoch {start_epoch} (best score {best['score']:.3f})")
+        best_label = "none" if best_any is None else f"epoch {best_any['epoch']}"
+        print(f"[resume] continuing from epoch {start_epoch} (best_any {best_label})")
 
     for ep in range(start_epoch, epochs):
         model.train(); t0 = time.time(); run = 0.0; nb = 0
@@ -238,15 +328,25 @@ def main():
             m = validate(model, val_ids, a.images, a.coarse_sdf, a.labels,
                          patch=cfg.get("patch", 96), steps=cfg.get("ode_steps", 8),
                          device=dev, max_cases=cfg.get("val_max_cases", 20))
-            better = checkpoint_is_better(m, best, prior_floor)
-            if better:
-                best = m
-                atomic_torch_save({"model": model.state_dict(), "cfg": cfg, "val": m,
-                                   "fold": a.fold, "seed": seed},
-                                  os.path.join(a.out, "best.pt"))
+            best_any, best_safe, write_any, write_safe = update_checkpoint_selection(
+                m, ep, best_any, best_safe, prior_floor, noninferiority_margin)
+            checkpoint = {"model": model.state_dict(), "cfg": cfg,
+                          "val": {**m, "epoch": ep,
+                                  "safe_eligible": is_safe(
+                                      m, prior_floor, noninferiority_margin)},
+                          "fold": a.fold, "seed": seed}
+            if write_any:
+                atomic_torch_save(checkpoint, best_any_path)
+            if write_safe:
+                atomic_torch_save(checkpoint, best_safe_path)
+            flags = " ".join(flag for flag, enabled in
+                             (("*BEST_ANY*", write_any), ("*BEST_SAFE*", write_safe))
+                             if enabled)
             print(f"[ep {ep:4d}] trainloss {run/max(1,nb):.4f} | val Dice {m['dice']:.3f} "
-                  f"clDice {m['cldice']:.3f} HD95 {m['hd95']:.2f} score {m['score']:.3f} "
-                  f"{'*BEST*' if better else ''} | {ep + 1}/{epochs} "
+                  f"clDice {m['cldice']:.3f} HD95 {m['hd95']:.2f} "
+                  f"gap {m['gap_mm']:.2f} Betti0 {m['betti0']:.2f} "
+                  f"safe={is_safe(m, prior_floor, noninferiority_margin)} {flags} | "
+                  f"{ep + 1}/{epochs} "
                   f"({100 * (ep + 1) / epochs:.1f}%) | epoch {time.time()-t0:.0f}s | "
                   f"wall {wall_elapsed / 60:.1f} min | ETA {eta / 60:.1f} min", flush=True)
             component_means = {key: value / max(1, nb)
@@ -259,19 +359,29 @@ def main():
                             "tv": component_means["tv"],
                             "total": component_means["total"],
                             "dice": m["dice"], "cldice": m["cldice"],
-                            "hd95": m["hd95"], "score": m["score"]})
+                            "hd95": m["hd95"], "gap_mm": m["gap_mm"],
+                            "betti0": m["betti0"],
+                            "safe_eligible": int(is_safe(
+                                m, prior_floor, noninferiority_margin)),
+                            "score": m["score"]})
             save_progress(a.out, history)   # progress.csv + progress.png every val step
 
         # Save after validation so the resume checkpoint carries the current
         # best-gate state rather than lagging one validation behind.
         if checkpoint_due:
             atomic_torch_save({"model": model.state_dict(), "opt": opt.state_dict(),
-                               "sched": sched.state_dict(), "epoch": ep, "best": best,
+                               "sched": sched.state_dict(), "epoch": ep,
+                               "best_any": best_any, "best_safe": best_safe,
                                "cfg": cfg, "fold": a.fold, "seed": seed}, last_path)
-    best_path = os.path.join(a.out, "best.pt")
-    print("[train] done. best:", best, "->", best_path if os.path.isfile(best_path)
-          else "no checkpoint beat the identity prior")
-    finish_manifest(a.out, "completed", {**best, "checkpoint_written": os.path.isfile(best_path)})
+    print("[train] done. best_any:", best_any, "->",
+          best_any_path if os.path.isfile(best_any_path) else "none")
+    print("[train] done. best_safe:", best_safe, "->",
+          best_safe_path if os.path.isfile(best_safe_path) else "no checkpoint passed safety gate")
+    finish_manifest(a.out, "completed", {
+        "best_any": best_any, "best_safe": best_safe,
+        "best_any_written": os.path.isfile(best_any_path),
+        "best_safe_written": os.path.isfile(best_safe_path),
+    })
     manifest_finished = True
     atexit.unregister(mark_interrupted)
 

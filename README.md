@@ -53,7 +53,7 @@ flow/        model.py               residual velocity U-Net (2 state + 8 cond �
              sampler.py             Heun ODE integration from coarse SDF
              sliding_window.py      coherent whole-volume inference (Gaussian blend, global noise)
              datasets.py            leakage-free foreground-centred patch dataset
-             train.py               training + real validation + best.pt by 0.5·Dice+0.5·clDice
+             train.py               training + lexicographic best-any/best-safe validation gates
              validate.py            sliding-window validation metrics
              selftest.py            CPU proof the residual refinement works (seconds)
 evaluation/  metrics.py             Dice, HD95, clDice, NSD (physical)
@@ -102,8 +102,13 @@ All three notebooks use this Drive layout beneath one shared `iac_runs` path:
 dataset_cache/Dataset801_IAC_LR/{imagesTr,labelsTr}
 configs_cache/splits.json
 sdf_cache_backup/{oof_probs,gt_sdf,coarse_sdf}
-flow_fold<N>/{last.pt,best.pt,progress.csv,progress.png}
+flow_fold<N>/{last.pt,best_any.pt,best_safe.pt,progress.csv,progress.png}
 ```
+
+On `--resume`, a legacy `best.pt` is preserved and copied once to
+`best_any.pt`; it is never promoted to `best_safe.pt` because legacy checkpoints
+lack the predeclared topology-aware selection record. New runs do not write
+`best.pt`.
 
 Before TrackB starts, `data/validate_pipeline_cache.py` checks split coverage,
 external-test isolation, required case files and readable cache archives. OOF

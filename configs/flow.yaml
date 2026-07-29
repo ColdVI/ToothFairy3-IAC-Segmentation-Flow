@@ -22,14 +22,17 @@ noise_frac: 0.5          # fraction of batches that get noise (rest are sigma=0)
 checkpoint_every: 10    # full resume checkpoint; reset loses at most 9 epochs
 val_every: 25
 val_max_cases: 20        # subsample val for speed during training
-# checkpoint score = 0.5*Dice + 0.5*clDice (ties -> lower HD95), set in validate.py
 # Filled only by scripts/identity_baseline.py --write-config after all 480 OOF
 # cases pass through the exact validation path. Training fails closed while null.
 prior_floor:
+  complete_cv: null
   dice: null
   cldice: null
   hd95: null
   score: null
+# User decision made after the complete identity baseline and before any B-run
+# result is seen. Never infer or tune this value from a partial/B-run result.
+noninferiority_margin: null
 
 # --- loss weights (endpoint-based topology terms) ---
 occ_tau: 0.05            # SDF -> occupancy sharpness

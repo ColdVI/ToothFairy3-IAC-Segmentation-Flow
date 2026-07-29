@@ -3,12 +3,9 @@
 validate.py — real validation inference for checkpoint selection.
 
 Runs the actual pipeline the model will be judged on (sliding-window ODE
-integration -> SDF decode -> per-side metrics), NOT the training loss. The
-checkpoint score is
-
-    S_val = 0.5 * meanDice + 0.5 * meanClDice     (ties broken by lower HD95)
-
-so `best.pt` is the model that segments best, not the one with the lowest MSE.
+integration -> SDF decode -> per-side metrics), NOT the training loss. It
+returns overlap, boundary, and topology metrics used by the lexicographic
+best-any / best-safe checkpoint policy in train.py.
 """
 import os
 import sys
@@ -23,6 +20,7 @@ from io_utils import physical_coord_grid, normalize_coords, voxel_spacing, sdf_s
 from conditioning import build_conditioning                                                   # noqa: E402
 from sliding_window import predict_volume                                                     # noqa: E402
 from evaluation.metrics import dice, cldice, hd95                                              # noqa: E402
+from evaluation.topology_metrics import betti0_error, centerline_gap_length                    # noqa: E402
 
 
 def _load_case(sid, images_dir, coarse_sdf_dir):
@@ -54,7 +52,9 @@ def validation_rows(model, val_ids, images_dir, coarse_sdf_dir, gt_labels_dir,
             rows.append({"case_id": sid, "side": side,
                          "dice": dice(pred == side, gt == side),
                          "cldice": cldice(pred == side, gt == side),
-                         "hd95": hd95(pred == side, gt == side, sp)})
+                         "hd95": hd95(pred == side, gt == side, sp),
+                         "gap_mm": centerline_gap_length(pred == side, gt == side, sp),
+                         "betti0": betti0_error(pred == side)})
         if progress:
             print(f"[validate] {case_index}/{len(ids)} {sid}", flush=True)
     return rows
@@ -64,7 +64,7 @@ def summarize_rows(rows, aggregation="per_side"):
     """Aggregate validation rows either directly or after bilateral case means."""
     if not rows:
         raise ValueError("cannot summarize an empty validation result")
-    metrics = ("dice", "cldice", "hd95")
+    metrics = ("dice", "cldice", "hd95", "gap_mm", "betti0")
     if aggregation == "per_side":
         values = {metric: [row[metric] for row in rows] for metric in metrics}
     elif aggregation == "per_case":
@@ -76,11 +76,12 @@ def summarize_rows(rows, aggregation="per_side"):
                 values[metric].append(float(np.nanmean([row[metric] for row in case_rows])))
     else:
         raise ValueError(f"unknown aggregation: {aggregation}")
-    mean_dice = float(np.nanmean(values["dice"]))
-    mean_cldice = float(np.nanmean(values["cldice"]))
-    mean_hd95 = float(np.nanmean(values["hd95"]))
+    means = {metric: float(np.nanmean(values[metric])) for metric in metrics}
+    mean_dice = means["dice"]
+    mean_cldice = means["cldice"]
+    mean_hd95 = means["hd95"]
     score = 0.5 * mean_dice + 0.5 * mean_cldice
-    return {"dice": mean_dice, "cldice": mean_cldice, "hd95": mean_hd95, "score": score}
+    return {**means, "score": score}
 
 
 def validate(model, val_ids, images_dir, coarse_sdf_dir, gt_labels_dir,
