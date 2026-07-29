@@ -23,6 +23,13 @@ checkpoint_every: 10    # full resume checkpoint; reset loses at most 9 epochs
 val_every: 25
 val_max_cases: 20        # subsample val for speed during training
 # checkpoint score = 0.5*Dice + 0.5*clDice (ties -> lower HD95), set in validate.py
+# Filled only by scripts/identity_baseline.py --write-config after all 480 OOF
+# cases pass through the exact validation path. Training fails closed while null.
+prior_floor:
+  dice: null
+  cldice: null
+  hd95: null
+  score: null
 
 # --- loss weights (endpoint-based topology terms) ---
 occ_tau: 0.05            # SDF -> occupancy sharpness

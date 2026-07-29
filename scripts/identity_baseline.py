@@ -41,6 +41,23 @@ def _atomic_json(path: Path, payload):
     os.replace(partial, path)
 
 
+def _write_prior_floor(config_path: Path, metrics):
+    """Replace the YAML prior_floor mapping without discarding comments/layout."""
+    lines = config_path.read_text().splitlines(keepends=True)
+    start = next((index for index, line in enumerate(lines)
+                  if line.rstrip() == "prior_floor:"), None)
+    if start is None:
+        raise ValueError(f"prior_floor block not found in {config_path}")
+    end = start + 1
+    while end < len(lines) and (lines[end].startswith(" ") or not lines[end].strip()):
+        end += 1
+    block = ["prior_floor:\n"] + [f"  {key}: {metrics[key]:.10g}\n"
+                                    for key in ("dice", "cldice", "hd95", "score")]
+    partial = config_path.with_suffix(config_path.suffix + ".partial")
+    partial.write_text("".join(lines[:start] + block + lines[end:]))
+    os.replace(partial, config_path)
+
+
 def _ordered_validation_ids(splits):
     ids = [sid for fold in splits["folds"] for sid in fold["val"]]
     duplicates = sorted(sid for sid, count in Counter(ids).items() if count != 1)
@@ -83,6 +100,9 @@ def main():
     parser.add_argument("--labels", required=True)
     parser.add_argument("--coarse-sdf", required=True)
     parser.add_argument("--out", default="outputs/baselines/identity_prior.json")
+    parser.add_argument("--config", default="configs/flow.yaml")
+    parser.add_argument("--write-config", action="store_true",
+                        help="write the complete-CV per-side metrics to config prior_floor")
     parser.add_argument("--patch", type=int, default=96)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--device", default="cpu")
@@ -140,6 +160,11 @@ def main():
         "delta_dice_vs_track_a": per_case["dice"] - 0.9101,
     }
     _atomic_json(Path(args.out), payload)
+    if args.write_config:
+        if missing:
+            raise SystemExit("refusing --write-config: identity baseline is not complete CV")
+        _write_prior_floor(Path(args.config), per_side)
+        print(f"[identity] wrote prior_floor -> {args.config}")
     print(f"[identity] {len(ids)}/{len(expected_ids)} cases -> {args.out}")
     print(f"[identity] per-side Dice={per_side['dice']:.4f}, "
           f"per-case Dice={per_case['dice']:.4f}, score={per_case['score']:.4f}")

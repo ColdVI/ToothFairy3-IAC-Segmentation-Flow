@@ -27,6 +27,9 @@ from datasets import IACFlowDataset                      # noqa: E402
 from validate import validate                            # noqa: E402
 
 
+PRIOR_METRICS = ("dice", "cldice", "hd95", "score")
+
+
 def load_yaml(path):
     try:
         import yaml
@@ -90,6 +93,31 @@ def save_progress(out_dir, history):
     plt.close(fig)
 
 
+def require_prior_floor(cfg):
+    """Return a validated identity-prior floor, refusing unsafe training configs."""
+    floor = cfg.get("prior_floor")
+    if not isinstance(floor, dict):
+        raise ValueError("config prior_floor is missing; run identity_baseline.py --write-config")
+    missing = [key for key in PRIOR_METRICS
+               if not isinstance(floor.get(key), (int, float))]
+    if missing:
+        raise ValueError("config prior_floor is incomplete "
+                         f"({', '.join(missing)}); run full-CV identity_baseline.py --write-config")
+    if not (0 <= floor["dice"] <= 1 and 0 <= floor["cldice"] <= 1
+            and 0 <= floor["score"] <= 1 and floor["hd95"] >= 0):
+        raise ValueError(f"invalid prior_floor values: {floor}")
+    return {key: float(floor[key]) for key in PRIOR_METRICS}
+
+
+def checkpoint_is_better(metrics, best, prior_floor, tolerance=1e-5):
+    """A candidate is eligible only after it strictly beats the measured prior."""
+    if metrics["score"] <= prior_floor["score"] + tolerance:
+        return False
+    return (metrics["score"] > best["score"] + tolerance) or (
+        abs(metrics["score"] - best["score"]) <= tolerance
+        and metrics["hd95"] < best["hd95"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/flow.yaml")
@@ -105,6 +133,7 @@ def main():
     a = ap.parse_args()
 
     cfg = load_yaml(a.config)
+    prior_floor = require_prior_floor(cfg)
     splits = json.load(open(a.splits))
     fold = splits["folds"][a.fold]
     train_ids, val_ids = fold["train"], fold["val"]
@@ -123,12 +152,15 @@ def main():
     epochs = cfg.get("epochs", 500)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
 
-    best = {"score": -1.0, "hd95": 1e9}
+    best = dict(prior_floor)
     start_epoch = 0
     history = []
     last_path = os.path.join(a.out, "last.pt")
     prog_csv = os.path.join(a.out, "progress.csv")
     wall_start = time.monotonic()
+    print(f"[train] identity prior floor: score={prior_floor['score']:.4f} "
+          f"Dice={prior_floor['dice']:.4f} clDice={prior_floor['cldice']:.4f} "
+          f"HD95={prior_floor['hd95']:.3f} mm")
     if a.resume and os.path.isfile(last_path):
         ck = torch.load(last_path, map_location=dev)
         model.load_state_dict(ck["model"])
@@ -183,8 +215,7 @@ def main():
             m = validate(model, val_ids, a.images, a.coarse_sdf, a.labels,
                          patch=cfg.get("patch", 96), steps=cfg.get("ode_steps", 8),
                          device=dev, max_cases=cfg.get("val_max_cases", 20))
-            better = (m["score"] > best["score"] + 1e-5) or (
-                abs(m["score"] - best["score"]) <= 1e-5 and m["hd95"] < best["hd95"])
+            better = checkpoint_is_better(m, best, prior_floor)
             if better:
                 best = m
                 torch.save({"model": model.state_dict(), "cfg": cfg, "val": m},
@@ -206,7 +237,9 @@ def main():
                             "dice": m["dice"], "cldice": m["cldice"],
                             "hd95": m["hd95"], "score": m["score"]})
             save_progress(a.out, history)   # progress.csv + progress.png every val step
-    print("[train] done. best:", best, "->", os.path.join(a.out, "best.pt"))
+    best_path = os.path.join(a.out, "best.pt")
+    print("[train] done. best:", best, "->", best_path if os.path.isfile(best_path)
+          else "no checkpoint beat the identity prior")
 
 
 if __name__ == "__main__":
