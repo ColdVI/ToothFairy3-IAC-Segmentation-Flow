@@ -1,37 +1,46 @@
 # CLAUDE.md — ToothFairy3 IAC Left/Right Segmentation with Residual Flow
 
-Persistent context for Claude Code sessions in this repository. Read this fully
-before touching any file. Everything here is measured, not assumed.
+Persistent context for coding agents working in this repository. Read the source
+before changing it: this document separates observations from code facts,
+conditional mathematics, untested explanations, and research decisions.
 
 ---
 
-## 1. What this project is
+## 1. Project and research question
 
-Two-track pipeline for **left/right Inferior Alveolar Canal (IAC)** segmentation
-in dental CBCT, built on ToothFairy3 (`Dataset801_IAC_LR`, 480 development cases,
-0.3 mm isotropic, LPS).
+This is a two-track pipeline for left/right Inferior Alveolar Canal (IAC)
+segmentation in dental CBCT using ToothFairy3.
 
-- **Track A — discriminative baseline.** nnU-Net v2, `3d_fullres`, trainer
-  `nnUNetTrainerIAC_NoMirror`, 5-fold CV, 1000 epochs/fold. **DONE. Do not retrain.**
-- **Track B — generative refinement.** A continuous-time flow that transports the
-  coarse nnU-Net SDF (`x0`) toward the GT SDF (`x1`), conditioned on the CBCT.
+- **Track A — discriminative prior.** nnU-Net v2, `3d_fullres`, trainer
+  `nnUNetTrainerIAC_NoMirror`, five folds, 1000 epochs per fold. Track A training
+  is complete and is not repeated for Track B debugging.
+- **Track B — refinement under study.** A model transports or directly refines
+  the out-of-fold nnU-Net SDF `x0` toward the GT SDF `x1`, conditioned on CBCT
+  and prior-derived channels.
 
-The research claim is **not** "higher Dice than nnU-Net". It is:
+The intended claim is not assumed true. The research question is:
 
-> Naive residual flow matching on top of a strong discriminative prior *degrades*
-> that prior; the cause is a degenerate probability path; a bridge formulation
-> fixes it and yields fewer topological breaks plus calibrated uncertainty at
-> non-inferior Dice.
+> We test whether a correctly derived stochastic bridge formulation can avoid
+> prior degradation and improve topology while maintaining non-inferior overlap.
 
-Clinical motivation: the IAC is a thin tubular structure whose *continuity* and
-*boundary upper bound* matter for nerve-injury risk in implant planning and molar
-extraction. Voxel overlap alone is the wrong success criterion.
+Any stochastic method must also be compared with a same-conditioning,
+approximately same-capacity deterministic direct refiner. Until such controls
+and the full-CV baseline exist, terms such as “fixes”, “calibrated uncertainty”,
+and “clinical safety envelope” are conclusions, not premises.
+
+Clinical motivation is continuity and boundary localisation of a thin tubular
+structure. Outputs are candidate segmentations for research; uncertainty maps
+may be called an **uncertainty envelope** or **candidate safety margin**, not a
+clinically validated safety envelope.
 
 ---
 
-## 2. Measured state (do not re-derive from memory — these are the real numbers)
+## 2. VERIFIED MEASUREMENTS
 
-### Track A, 5-fold CV, `Mean Validation Dice`
+These are observations from existing artifacts. They do not by themselves prove
+a causal mechanism.
+
+### 2.1 Track A, five-fold CV, `Mean Validation Dice`
 
 | fold | Dice   | epochs | wall (A100) |
 |------|--------|--------|-------------|
@@ -41,11 +50,13 @@ extraction. Voxel overlap alone is the wrong success criterion.
 | 3    | 0.9147 | 1000   | ~10.7 h     |
 | 4    | 0.9111 | 1000   | ~10.7 h     |
 
-**Mean 0.9101 ± 0.0032.** Total ≈ 54 A100-hours already spent. Literature anchor:
-ToothFairy2 challenge report (MIA 2026) — the five best methods all land near
-0.89 DSC on IACs. The baseline is healthy and consistent.
+Mean: **0.9101 ± 0.0032**. Approximately 54 A100-hours were spent. These
+reported validation numbers are the Track A reference, but the paper baseline
+still requires evaluation through the exact full-CV comparison pipeline.
 
-### Track B, fold 0, 125/500 epochs (`progress.csv`)
+### 2.2 Existing Track B progress artifact
+
+The existing fold-0 progress artifact reports:
 
 | epoch | trainloss | dice   | cldice | hd95 (mm) | score  |
 |-------|-----------|--------|--------|-----------|--------|
@@ -56,214 +67,337 @@ ToothFairy2 challenge report (MIA 2026) — the five best methods all land near
 | 100   | 0.1838    | 0.7982 | 0.9928 | 2.052     | 0.8955 |
 | 125   | 0.1691    | 0.7969 | 0.9931 | 2.058     | 0.8950 |
 
-Signature: **train loss falls, validation Dice converges 0.09 BELOW the untouched
-prior, HD95 degrades 5×, clDice never moves.** This is not underfitting. It is a
-structural misalignment between the trained objective and the evaluated one.
+The artifact shows falling training loss together with lower validation Dice and
+higher HD95 than its epoch-0 row. It does **not** establish why. Its precise case
+set and OOF provenance must be audited before using it as paper evidence.
+
+### 2.3 Prompt-1 cache and identity preflight state
+
+- The configured development cohort contains 480 P/F cases; the held-out S
+  scanner cohort contains 52 separate cases.
+- At the latest audit, only 40/480 development cases had the complete local
+  OOF/coarse/GT-SDF cache needed by the identity tool.
+- A partial 40-case full-path `v=0` diagnostic measured Dice 0.8698, clDice
+  0.9680, HD95 5.671 mm, and score 0.9189.
+- That output has `complete_cv=false` and is **not** a prior floor.
+- One tested SDF sign round-trip changed zero voxels.
+
+The 40-case result is not a trustworthy baseline until direct hard mask, direct
+SDF sign decode, and full sliding-window identity are compared case by case.
 
 ---
 
-## 3. THE CORE DIAGNOSIS — read this before proposing any fix
+## 3. CODE-VERIFIED FACTS
 
-### 3.1 The probability path is algebraically invertible
+These statements follow from the current source. They are not claims about what
+the trained model internally learned.
 
-In `flow/datasets.py`, `x0 = coarse_sdf` and **the same array** is also passed to
-`build_conditioning(...)` as channels 3 and 4. So the network sees both `x_t` and
-`x0`. Then:
+### 3.1 Current state and conditioning path
 
-```
-x_t = (1-t)*x0 + t*x1
-x_t - x0 = t*(x1 - x0) = t*u
-=>  u = (x_t - x0) / t
-```
+`flow/datasets.py` loads `coarse_sdf` as `x0` and also supplies the same clean
+coarse SDF as conditioning channels 3 and 4. `flow/train.py` may add noise to
+the state start, constructs `x_t` from that noised start, and leaves the
+conditioning coarse-SDF channels clean.
 
-The regression target is a **closed-form algebraic function of the network's own
-inputs**. The model can drive the flow-matching MSE toward zero by computing
-`(state_channels - cond_channels[3:5]) / t` without ever looking at the CBCT.
-It is learning division, not segmentation.
+For a deterministic batch (`sigma=0`):
 
-### 3.2 The inference rollout collapses to a single evaluation at t=0
-
-Assume the shortcut `v = (x - x0)/t` is learned. Euler integration:
-
-```
-k=0 : t=0,   x=x0                -> v = 0/0, network emits some w
-                                    x_1 = x0 + dt*w
-k=1 : t=dt,  x=x0+dt*w           -> v = (dt*w)/dt = w
-                                    x_2 = x0 + 2*dt*w
-...
-k=N : x_N = x0 + w
+```text
+x_t = (1-t)x0 + t x1
+x_t - x0 = t(x1-x0)
+u = x1-x0 = (x_t-x0)/t,  t>0
 ```
 
-The entire 8-step Heun/Euler ODE reduces to `x0 + w`, where `w` is the network
-output at `t=0`. **All training at t>0 is wasted.** And `t≈0` — the only regime
-that determines the output — is exactly where `x_t ≈ x0` carries zero information
-about `x1` and the objective is worst-conditioned. This explains falling train
-loss with collapsing validation.
+The FM target is therefore an algebraic function of inputs available to the
+network. This establishes that a shortcut **exists**. It does not establish
+that a trained network uses it.
 
-`train_sigma=0.1, noise_frac=0.5` partially breaks this: with `x_t` built from a
-noised `x0`, the shortcut estimate is off by `sigma*eps/t`. But it is active in
-only half the batches and the model cannot tell which batch it is in, so it
-learns a blend of the shortcut and the conditional mean.
+### 3.2 Current loss and endpoint estimate
 
-### 3.3 The loss has no overlap term, and its only shape term rewards thickening
+The current loss combines FM, optional narrow-band, soft-clDice, laterality,
+and TV terms. It has no soft-Dice overlap term. For velocity parameterisation:
 
-`total_loss` = FM + 1.0·narrowband + 0.5·clDice + 0.5·laterality. There is **no
-Dice/overlap term at all**. Meanwhile soft-clDice:
-
-```
-T_sens = sum(S_gt * V_pred) / sum(S_gt)
+```text
+x1_hat = x_t + (1-t) pred_v
 ```
 
-increases monotonically with predicted mass, while `T_prec` stays flat under
-uniform thickening (the skeleton remains central). So soft-clDice **rewards
-inflating the tube**. The original clDice paper (Shit et al., CVPR 2021) uses
-`L = (1-a)*L_softDice + a*L_softclDice` for exactly this reason; the soft-Dice
-leg was dropped here.
+At large `t`, this endpoint estimate includes a large fraction of GT through
+`x_t`; gradients from endpoint auxiliary terms to `pred_v` are multiplied by
+`1-t`. The coordinate-aware laterality option exists in `flow/losses.py`, but
+the current training loop does not pass `lateral_coord`. The overlap-only
+laterality term is not mathematically identical to zero, although it can be
+numerically negligible in patches containing only one canal.
 
-Quantitative check: IAC radius ≈ 1.58 mm ≈ 5.3 voxels. Under uniform dilation by
-`d` voxels, `Dice = 2 / (1 + (1 + d/r)^2)`. Observed Dice 0.798 implies
-`d ≈ 1.2` voxels ≈ 0.36 mm. **The Dice drop is fully explained by ~1 voxel of
-uniform thickening**, and so is clDice staying pinned at 0.993.
+### 3.3 Sliding-window numerics
 
-### 3.4 HD95 = 2.05 mm is NOT explained by thickening — it needs localized outliers
+`flow/sliding_window.py` uses a separable Gaussian with `sigma_scale=0.125` and
+divides accumulated output by `max(wsum, 1e-6)`. The one-axis endpoint weight is
+approximately `exp(-32)`; a three-axis patch corner is approximately
+`exp(-96)`. Whether this creates observed false positives is an empirical
+hypothesis.
 
-0.36 mm of dilation cannot produce 2.05 mm HD95. Two candidates, both testable:
+### 3.4 Physical SDF and evaluation
 
-1. **Train/inference patch distribution mismatch.** `fg_prob: 0.8` means 80% of
-   training patches are canal-centred. `flow/sliding_window.py` tiles the *whole*
-   volume, including pure-background patches where the coarse SDF is saturated at
-   +1 everywhere — a regime the model never trained on. It must emit `v≈0` there
-   and was never taught to.
-2. **Gaussian blend numerics.** `acc /= np.maximum(wsum, 1e-6)` with
-   `sigma_scale=0.125` gives corner weights of `exp(-32) ≈ 1e-14`, so the `1e-6`
-   floor crushes those voxels toward 0. `sdf_stack_to_mask` decodes `min(L,R) < 0`,
-   so a marginally negative value there becomes foreground.
+- `data/io_utils.py` computes SDFs using
+  `distance_transform_edt(sampling=spacing)`, in physical millimetres.
+- `sdf_stack_to_mask` decodes negative SDF values as foreground and selects the
+  more-negative L/R channel.
+- Evaluation implements Dice, HD95, NSD, clDice, Betti-0 error, centerline gap,
+  false-branch length, empty prediction, and L/R swap rate.
 
-Diagnostic: histogram of the distance from each false-positive connected component
-to the nearest GT voxel. Bimodal (near + far) confirms this.
+### 3.5 OOF prior artifact semantics
 
-### 3.5 The auxiliary losses are mostly scoring the ground truth
+`nnunet/predict_oof.py` currently runs each validation case with its expected
+fold model, but converts the resulting hard segmentation into:
 
 ```python
-x_t    = (1-t)*x0 + t*x1
-x1_hat = x_t + (1-t)*pred_v
+prob_left  = (seg == 1).astype(np.float16)
+prob_right = (seg == 2).astype(np.float16)
 ```
 
-At `t=0.9`, `x1_hat = 0.1*x0 + 0.9*x1 + 0.1*v` — **90% ground truth.** The
-clDice / narrowband / laterality terms see a near-perfect shape regardless of `v`,
-and their gradient w.r.t. `v` is damped by `(1-t)`. They only bite at small `t`.
+Therefore the existing `prob_left`/`prob_right` arrays are **derived one-hot hard
+masks**, not calibrated softmax probabilities. Consequences:
 
-Also: `laterality_loss` returns `mean(occ_l * occ_r)`. A 96³ patch spans 28.8 mm;
-the two canals are ~30-40 mm apart and effectively never co-occur in one patch.
-That term is **identically zero** — dead weight, `w_laterality=0.5`
-notwithstanding. `laterality_coord_weight` is 0 *and* `lateral_coord` is never
-passed to `total_loss` from the training loop, so side-consistency is entirely
-unenforced; swap prevention currently relies on conditioning alone.
+- Values are expected to be binary, not continuous confidences.
+- They carry no nnU-Net confidence or entropy information.
+- Conditioning channels 1–2 are largely redundant with coarse-SDF channels
+  3–4, because both are derived from the same hard segmentation.
+- The filenames alone do not encode artifact type, source checkpoint, or fold;
+  provenance must be supplied by a manifest and audited.
+- A fold-aware script is leakage-free only if the actual split, checkpoint, and
+  per-case provenance match. Existing artifacts are not trusted by filename.
 
-### 3.6 The checkpoint gate has no "do no harm" floor
+Hard and soft artifacts must remain distinct:
 
-`best.pt` can be written with a score below the untouched prior. The prior is a
-fixed, known floor and must be encoded as a hard threshold.
+```text
+oof_hard/       hard segmentation or explicitly derived one-hot arrays
+oof_softmax/    true nnU-Net softmax export with class probabilities
+```
 
-### 3.7 The Track B baseline number does not match Track A
-
-`validate()` reports 0.8867 at epoch 0; Track A CV is 0.9101. The SDF round-trip
-is sign-preserving and therefore lossless, so the gap is either `val_max_cases=20`
-sampling noise or a metric-definition mismatch (per-side vs per-case averaging).
-**This number is the baseline row of the paper.** It must be reproduced on the
-full CV with `v ≡ 0` before any comparison is trustworthy.
+A backward-compatible adapter may read legacy `oof_probs/`, but must label its
+contents from evidence. It must never relabel a hard mask as true softmax.
 
 ---
 
-## 4. What is already correct — do not "improve" these
+## 4. CONDITIONAL THEOREMS / DERIVATIONS
 
-- **Leakage-free OOF prior** (`nnunet/predict_oof.py`). Fold `f` is predicted by
-  the model trained on the other four. Most refinement papers get this wrong.
-- **Physical millimetre SDF** — anisotropic `distance_transform_edt(sampling=spacing)`,
-  single source of truth in `data/io_utils.py`.
-- **Checkpoint selection on a segmentation metric**, not on training loss.
-- **`nnUNetTrainerIAC_NoMirror`** — default L/R mirroring semantically swaps the
-  two classes. ToothFairy2's top method (Isensee & Kirchhoff) disabled it too.
-- **Endpoint-based auxiliary losses** — constraining the object actually produced
-  at `t=1` is the right instinct, even though the current form is diluted by GT.
-- **`evaluation/`** — Betti-0, centerline gap, false-branch length, NSD, L/R swap
-  rate, `compare_bootstrap`. This is ahead of the field for this task and is
-  effectively the paper's evaluation section already written.
-- **Colab resume/persist discipline** — `checkpoint_every`, `persist_stage`,
-  atomic `.partial` writes.
+These results are mathematically valid under their stated assumptions. They are
+not measurements of a trained checkpoint.
+
+### 4.1 Noised-state shortcut error
+
+Let `x0n = x0 + sigma*eps`, let training use
+`x_t=(1-t)x0n+t*x1`, and let conditioning expose clean `x0`. The analytic
+clean-prior shortcut differs from the FM target by:
+
+```text
+v_shortcut = (x_t-x0)/t
+u          = x1-x0n
+v_shortcut-u = sigma*eps/t
+```
+
+Thus squared shortcut error from this noise term scales as
+`sigma^2/t^2` in expectation. This does not show that the network implements the
+shortcut.
+
+### 4.2 Rollout collapse if the shortcut is learned exactly
+
+Assume inference starts at `x=x0`, the network emits a finite `w` at `t=0`, and
+for every later step exactly implements `v=(x-x0)/t`. Euler gives:
+
+```text
+x(dt)   = x0 + dt*w
+v(dt)   = w
+x(2dt)  = x0 + 2dt*w
+...
+x(1)    = x0 + w
+```
+
+The same cancellation applies to the corresponding Heun evaluations under the
+exact assumption. Therefore the multi-step rollout collapses to the first
+finite endpoint direction **if the shortcut is learned exactly**. Whether the
+checkpoint satisfies this assumption is tested with causal ablations and
+similarity measures; it is not a measured fact.
+
+### 4.3 Auxiliary-loss GT mixture
+
+For the current rectified path and velocity endpoint estimate:
+
+```text
+x1_hat = (1-t)x0 + t*x1 + (1-t)pred_v
+```
+
+At `t=0.9`, 90% of `x1_hat` is explicitly `x1`, and the derivative with respect
+to `pred_v` is `1-t=0.1`. This proves the mixture and gradient scaling. Its
+practical effect on optimisation remains an empirical question.
+
+### 4.4 Geometric dilation compatibility calculation
+
+For an ideal cylindrical cross-section of radius `r`, uniform dilation by `d`
+has the approximate overlap:
+
+```text
+Dice = 2 / (1 + (1+d/r)^2)
+```
+
+This can show that an observed Dice loss is **compatible with** a dilation. It
+cannot show that thickening fully explains an actual prediction without volume,
+surface-distance, erosion, and radius-profile measurements.
 
 ---
 
-## 5. Non-negotiable invariants
+## 5. HYPOTHESES TO TEST
 
-1. **Never train the flow on in-sample nnU-Net predictions.** OOF only.
-2. **Ground truth never enters any inference path.** Not `x0`, not the
-   conditioning, not the sliding window. If a function needs `sdf_gt` to run at
-   inference, that function is wrong.
-3. **SDF distances are always in physical millimetres**, never voxel units.
-4. **Never re-enable L/R mirror augmentation** anywhere in the pipeline.
-5. **`best.pt` may only be written if the score beats the measured prior floor.**
-6. **Every loss component is logged separately, every validation step.**
-7. **Every run writes a manifest**: git commit SHA, full resolved config, config
-   hash, fold, seed, start/end time, and the resulting metrics.
-8. **Every training entry point must support `--resume` from the last checkpoint**
-   and must be safe to kill at any moment (atomic writes, no partial state).
-9. **Do not modify anything under `nnunet/` that would require retraining Track A.**
-10. **No new feature, loss term, or architecture change may be added until the
-    current stage's acceptance criteria pass.** Ablate before you tune.
-
----
-
-## 6. Repo layout
-
-```
-configs/          flow.yaml (Track B hyperparameters), splits.json (fold definitions)
-data/             io_utils.py (SDF, spacing, coords), compute_gt_sdf.py, compute_coarse_sdf.py,
-                  validate_pipeline_cache.py
-nnunet/           predict_oof.py — leakage-free OOF probability maps
-flow/             model.py (ResidualVelocityUNet3D), losses.py, datasets.py, sampler.py,
-                  sliding_window.py, train.py, validate.py, conditioning.py, selftest.py
-evaluation/       metrics.py (Dice/HD95/clDice/NSD), topology_metrics.py, evaluate_cv.py
-notebooks/        IAC_Colab_runner.ipynb, colab_trackB_only.ipynb, mac_local_oof_sdf.ipynb
-archive/          v0_flat_flow/ — the abandoned noise-to-SDF formulation. Reference only.
-docs/             project_notes.md
-```
-
-Channel contract (must stay in sync across `model.py`, `conditioning.py`, `flow.yaml`):
-
-```
-FLOW_STATE_CH = 2   # [Left SDF, Right SDF]
-COND_CH       = 8   # [CBCT, prob_L, prob_R, coarse_SDF_L, coarse_SDF_R, x, y, z]
-```
+1. **Learned shortcut use.** The trained velocity model relies on `x_t` and clean
+   `x0` while being insensitive to CBCT. Test with CBCT zero/noise/shuffle,
+   cross-case coarse-SDF swaps, analytic-shortcut cosine similarity and R²,
+   checkpoint progression, foreground/background strata, and case bootstrap CIs.
+2. **Small-t profile.** Deterministic small-t loss may plateau because `x_t`
+   contains little target information; noised shortcut error may grow like
+   `sigma²/t²`. A low large-t loss alone is not evidence of shortcut use because
+   `x_t` already contains `x1` information.
+3. **Uniform thickening.** The Dice/clDice pattern may be compatible with tube
+   inflation. Test physical erosion, volume ratios, signed surface distances,
+   and radius profiles.
+4. **Patch-distribution mismatch.** Foreground-biased training may cause errors
+   on pure-background patches encountered by whole-volume inference.
+5. **Gaussian blending failure.** Very small boundary weights plus the `1e-6`
+   denominator floor may change signs or shrink SDF magnitude near volume edges.
+6. **Localised HD95 outliers.** Far false-positive components rather than uniform
+   thickening may drive HD95. Test component-to-GT distance distributions.
+7. **Auxiliary-loss dilution.** GT mixture and `(1-t)` gradients may make current
+   auxiliary losses ineffective at large `t`.
+8. **Stochastic bridge utility.** A correctly derived bridge may avoid prior
+   degradation and improve topology at non-inferior overlap; it must first pass
+   a known-distribution 1-D toy test and deterministic-refiner controls.
+9. **Curve-space feasibility.** A longest-path spline may compactly represent
+   ordinary canals, but can erase bifid/accessory anatomy. Fit failures,
+   rasterised connectivity, self-intersections, endpoint errors, and lost branch
+   length must be measured before making a contribution claim.
 
 ---
 
-## 7. Compute and workflow constraints
+## 6. RESEARCH DECISIONS AND CONSTRAINTS
 
-- GPU is **rented Colab** (A100/T4, session-limited, disconnects without warning).
-  Persistent storage is Google Drive. Local machine is an M4 MacBook (MPS for
-  inference, CPU for SDF).
-- Only three stages genuinely need a GPU: Track A training (done), OOF prediction
-  (done), Track B flow training.
-- **Never launch a long run without a smoke test first**: 3-5 epochs, tiny patch,
-  2 cases, assert the loop completes, checkpoints write, and `--resume` works.
-- Prefer many short cheap experiments over one long expensive one. A 50-epoch
-  fold-0 ablation that answers a yes/no question beats a 500-epoch run that
-  answers nothing.
-- Assume the session dies mid-run. Design every script accordingly.
+### 6.1 Non-negotiable invariants
+
+1. **Never train Track B on in-sample nnU-Net predictions.** OOF only.
+2. **Ground truth never enters inference.** If inference needs `sdf_gt`, it is
+   invalid.
+3. **SDF distances remain physical millimetres**, never voxel units.
+4. **Do not use naive L/R mirroring.** Label-aware class/channel swapping may be
+   a separately predeclared ablation. Existing Track A models are not retrained
+   for it because Track A is complete.
+5. **Safe checkpoints require a measured complete-CV prior and a predeclared
+   non-inferiority margin.** Partial baselines never set the floor.
+6. **Log every loss component separately** at every validation step.
+7. **Every run writes a manifest:** git SHA, dirty flag, resolved config and hash,
+   fold, seed, environment, times, provenance, and resulting metrics.
+8. **Every long entry point is resumable, idempotent, and atomic.** A session may
+   die after any case or epoch.
+9. **Do not modify Track A in a way that requires retraining.**
+10. **Do not add a new feature, loss, or architecture before the current stage's
+    acceptance criteria pass.** Ablate before tuning.
+11. **The 52-case S scanner cohort is never used for debugging, tuning, model
+    selection, qualitative case selection, or threshold selection.** It is
+    opened once after the final development configuration is locked; failure is
+    reported without returning to development for reselection.
+12. **Hard one-hot OOF masks are never described as calibrated probabilities.**
+    Every OOF artifact records whether it is hard segmentation, derived one-hot,
+    or true softmax.
+13. **Every final flow comparison includes a same-conditioning, approximately
+    same-capacity deterministic direct-refinement control.**
+14. **Verified measurements, code-verified facts, conditional derivations,
+    hypotheses, and intended research claims remain explicitly separated.**
+15. **No stochastic bridge sampler is used in 3-D before its derivation and a
+    known-distribution 1-D toy test pass.**
+
+### 6.2 Model-selection contract
+
+- `last.pt`: always updated for resume.
+- `best_any.pt`: best validation checkpoint within a run, even below the prior;
+  retained for debugging.
+- `best_safe.pt`: written only after the predeclared non-inferiority condition.
+- Selection is not reduced to one weighted score. Eligibility checks Dice
+  non-inferiority first, then ranks topology, HD95, clDice, and earlier epoch.
+- The non-inferiority margin is `null` until the full 480-case identity baseline
+  is complete and the user sets the margin before seeing any B-run result.
+
+### 6.3 OOF and held-out-data contract
+
+- Development is the 480-case P/F cohort used for five-fold OOF construction.
+- S is the 52-case scanner-shift cohort and is excluded from all Prompt-1
+  manifests and all model-development decisions.
+- Every OOF case records expected fold, actual prediction fold, source
+  checkpoint, artifact type, shape, affine, spacing, and checksum.
+- `oof_hard/` and `oof_softmax/` are separate queues and artifacts. Missing true
+  softmax is reported, never fabricated from one-hot masks.
+
+### 6.4 CurveFlow and uncertainty language
+
+A single spline does not guarantee a clinically or raster-topologically valid
+canal. Connectivity is tested after rasterisation. The longest-path step can
+delete bifid or accessory branches and is a primary feasibility risk. Report
+bifid and non-bifid cases separately, including lost branch length and
+failed-fit rate.
+
+Stochastic sample variance is only one uncertainty method. It is compared with
+true-softmax entropy, TTA variance, feasible MC-dropout/ensemble controls, and a
+naive morphological envelope. Monte Carlo stability is measured; `K=16` is not
+treated as clinical sufficiency.
 
 ---
 
-## 8. Working style expected of you (Claude Code)
+## 7. Channel and artifact contracts
 
-- **Read the source before changing it.** This file describes the code; it is not
-  a substitute for the code.
-- **One concern per commit.** Message format: `stage/topic: what changed and why`.
-- **Write the test before the feature** when the feature is a metric or a loss.
-  A metric you have not validated against a known-answer input is not a metric.
-- **State assumptions explicitly** and flag anything in this file that the code
-  contradicts — this document can go stale.
-- **Do not silently widen scope.** If a task implies a change to a file outside
-  the stated scope, stop and say so.
-- Explanations should be mechanistic: name the variable, trace the tensor shape,
-  derive the formula. High-level summaries are not useful here.
+Current channel order:
+
+```text
+FLOW_STATE_CH = 2  [Left SDF, Right SDF]
+COND_CH       = 8  [CBCT, hard_L, hard_R, coarse_SDF_L, coarse_SDF_R, x, y, z]
+```
+
+Legacy code may call channels 1–2 `prob_left` and `prob_right`; for current
+derived-one-hot artifacts, documentation and manifests use `hard_L`/`hard_R`.
+Changing conditioning channels requires a single-source channel contract and
+tests across model, dataset, validation, and sliding-window inference.
+
+---
+
+## 8. Compute and workflow
+
+- All dataset-scale work runs in Google Colab. Persistent inputs and outputs are
+  on Google Drive; the repository may be cloned under `/content`.
+- Local `/Users/...` paths are never embedded in runtime code or notebooks.
+- The local Mac is for editing only. Do not assume local data, CUDA, MPS, or long
+  CPU runs.
+- Track A training is complete. Missing fold-aware OOF inference may reuse the
+  existing Track A checkpoints but must never retrain them.
+- Before a long queue, run a two-case smoke test covering prediction, validation,
+  atomic Drive write, interruption, and resume.
+- Every case is independently validated and persisted. Completed valid artifacts
+  are skipped on restart; failures and retries remain visible.
+- Do not run Prompt 2–6, B0–B4, or any 3-D bridge training until Prompt 1 is
+  complete and its explicit user decisions are set.
+
+---
+
+## 9. Repository map and working style
+
+```text
+configs/          Track B configuration and fold definitions
+data/             geometry, SDF, cache preparation and validation
+nnunet/           completed Track A definitions and fold-aware OOF inference
+flow/             current residual-flow model, losses, training and validation
+evaluation/       overlap, boundary and topology metrics
+analysis/         non-mutating audits and diagnostic probes
+scripts/          manifests and orchestration helpers
+notebooks/        Colab runners; persistent artifacts remain on Drive
+archive/          abandoned/reference implementations only
+```
+
+- Read source before editing; this file may be stale.
+- One concern per commit: `stage/topic: what changed and why`.
+- Write known-answer tests before changing metrics or losses.
+- State assumptions and provenance. Never turn a hypothesis into a fact through
+  wording.
+- Do not silently widen scope. Prompt 1 hardening must not implement Prompt 2–6.
