@@ -21,7 +21,12 @@ def _gaussian_weight(patch, sigma_scale=0.125):
         shape = [1, 1, 1]
         shape[ax] = len(c)
         g = g * np.exp(-(c ** 2) / (2 * sigma_scale ** 2)).reshape(shape).astype(np.float32)
-    return g
+    # The raw 3-D corner is exp(-96) for sigma_scale=.125. In float32 this is
+    # subnormal, and the old denominator floor shrank an identity SDF toward
+    # zero at volume boundaries. A relative positive floor preserves a stable
+    # blend without changing coverage or inventing an outside-SDF value.
+    g /= g.max()
+    return np.maximum(g, np.finfo(np.float32).eps)
 
 
 def _tile_starts(size, patch, step):
@@ -69,5 +74,7 @@ def predict_volume(model, cond_vol, coarse_sdf_vol, patch=96, overlap=0.5,
                 gwp = gw[:dz, :dy, :dx]
                 acc[:, sl[0], sl[1], sl[2]] += endp[:, :dz, :dy, :dx] * gwp
                 wsum[sl[0], sl[1], sl[2]] += gwp
-    acc /= np.maximum(wsum, 1e-6)[None]
-    return acc
+    covered = wsum > 0
+    output = np.ones_like(acc)       # defensive outside SDF for impossible uncovered voxels
+    np.divide(acc, wsum[None], out=output, where=covered[None])
+    return output
