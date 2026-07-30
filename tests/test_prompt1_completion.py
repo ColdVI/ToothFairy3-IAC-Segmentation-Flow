@@ -1,9 +1,11 @@
 import json
 
+import numpy as np
 import pytest
 
 import _pathsetup  # noqa: F401
-from scripts.prompt1_completion import (CompletionState, atomic_copy,
+from scripts.prompt1_completion import (CompletionState, NonRetryableCaseError,
+                                         assert_voxelwise_match, atomic_copy,
                                          run_case_queue)
 
 
@@ -70,3 +72,29 @@ def test_case_failure_gets_only_two_automatic_retries(tmp_path):
     assert calls == ["case_a", "case_a", "case_a"]  # initial + two retries
     assert state.data["retry_counts"]["oof"]["case_a"] == 2
     assert "GPU failure" in state.data["failed_cases"]["oof"]["case_a"]["error"]
+
+
+def test_legacy_voxel_mismatch_is_nonretryable(tmp_path):
+    state = CompletionState(tmp_path / "state.json", "abc123", "cuda")
+    calls = []
+
+    def mismatch(case_id):
+        calls.append(case_id)
+        assert_voxelwise_match(np.zeros((2, 2, 2), np.uint8),
+                               np.ones((2, 2, 2), np.uint8), case_id)
+
+    completed = run_case_queue("provenance_bootstrap", ["case_a"], state,
+                               mismatch, lambda _case_id: False,
+                               retry_failed=True, heartbeat_every=1)
+    assert completed == 0
+    assert calls == ["case_a"]
+    error = state.data["failed_cases"]["provenance_bootstrap"]["case_a"]["error"]
+    assert "8 changed voxels" in error
+    assert state.data["retry_counts"]["provenance_bootstrap"]["case_a"] == 0
+
+
+def test_legacy_voxel_match_accepts_identical_masks():
+    mask = np.arange(8, dtype=np.uint8).reshape(2, 2, 2)
+    assert assert_voxelwise_match(mask, mask.copy(), "case_a") == 0
+    with pytest.raises(NonRetryableCaseError, match="shape mismatch"):
+        assert_voxelwise_match(mask, np.zeros((2, 2, 3), np.uint8), "case_a")

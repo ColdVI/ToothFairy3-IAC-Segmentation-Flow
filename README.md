@@ -105,7 +105,7 @@ for the current Prompt-1 completion run.
 All three notebooks use this Drive layout beneath one shared `iac_runs` path:
 
 ```
-dataset_cache/Dataset801_IAC_LR/{imagesTr,labelsTr}
+dataset_cache_colab_v1/Dataset801_IAC_LR/{imagesTr,labelsTr}
 configs_cache/splits.json
 sdf_cache_backup/{oof_probs,oof_hard,oof_softmax,gt_sdf,coarse_sdf,oof_manifest.json}
 outputs/{prompt1_completion_state.json,prompt1/cache_manifest_480.json}

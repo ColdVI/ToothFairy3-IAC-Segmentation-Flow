@@ -46,6 +46,10 @@ MAX_AUTOMATIC_RETRIES = 2
 HEARTBEAT_EVERY = 10
 
 
+class NonRetryableCaseError(RuntimeError):
+    """A deterministic case failure for which another identical run is wasteful."""
+
+
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
@@ -71,6 +75,20 @@ def atomic_copy(source, destination, replace_invalid=False):
     shutil.copy2(source, partial)
     os.replace(partial, destination)
     return sha256_file(destination)
+
+
+def assert_voxelwise_match(reference_mask, reproduced_mask, case_id):
+    reference_mask = np.asarray(reference_mask)
+    reproduced_mask = np.asarray(reproduced_mask)
+    if reference_mask.shape != reproduced_mask.shape:
+        raise NonRetryableCaseError(
+            f"legacy OOF bootstrap shape mismatch for {case_id}: "
+            f"{reference_mask.shape} != {reproduced_mask.shape}")
+    changed = int(np.count_nonzero(reference_mask != reproduced_mask))
+    if changed:
+        raise NonRetryableCaseError(
+            f"legacy OOF bootstrap mismatch for {case_id}: {changed} changed voxels")
+    return changed
 
 
 def _under(child, parent):
@@ -190,7 +208,8 @@ def run_case_queue(stage, cases, state, worker, validator, fold_map=None,
             except Exception as error:  # continue queue after bounded retries
                 failures = state.fail(stage, case_id, error)
                 retries_used = failures - 1
-                if not retry_failed or retries_used >= MAX_AUTOMATIC_RETRIES:
+                if (isinstance(error, NonRetryableCaseError) or not retry_failed
+                        or retries_used >= MAX_AUTOMATIC_RETRIES):
                     print(f"[{stage}] FAILED {case_id}: {error}", flush=True)
                     break
                 print(f"[{stage}] retry {retries_used + 1}/{MAX_AUTOMATIC_RETRIES} "
@@ -380,6 +399,8 @@ class Prompt1Runner:
             recorded_matches = recorded.is_file() and recorded.resolve() == actual.resolve()
             checksum_matches = bool(case.get("hard_sha256")) and (
                 case["hard_sha256"] == sha256_file(actual))
+            checkpoint_checksum_matches = bool(case.get("source_checkpoint_sha256")) and (
+                case["source_checkpoint_sha256"] == self._cached_sha256(checkpoint))
             _, _, actual_type = load_oof(actual)
         except Exception:
             return False
@@ -387,7 +408,27 @@ class Prompt1Runner:
                 and bool(checkpoint) and Path(checkpoint).is_file()
                 and case.get("artifact_type") == actual_type
                 and actual_type in ("hard_segmentation", "derived_one_hot")
-                and recorded_matches and checksum_matches)
+                and recorded_matches and checksum_matches and checkpoint_checksum_matches)
+
+    def bootstrap_provenance_valid(self, case_id):
+        if not self.provenance_valid(case_id) or not self.softmax_valid(case_id):
+            return False
+        case = self._provenance().get("cases", {}).get(case_id, {})
+        legacy = find_case_artifact(self.legacy_hard_dir, case_id)
+        softmax = self.softmax_dir / f"{case_id}.npz"
+        if legacy is None:
+            return False
+        try:
+            return (case.get("verification_method") == "legacy_reprediction_voxelwise"
+                    and case.get("legacy_voxelwise_match") is True
+                    and case.get("legacy_changed_voxels") == 0
+                    and case.get("legacy_hard_artifact") == str(legacy)
+                    and case.get("legacy_hard_sha256") == sha256_file(legacy)
+                    and bool(case.get("reproduced_hard_sha256"))
+                    and case.get("softmax_artifact") == str(softmax)
+                    and case.get("softmax_sha256") == sha256_file(softmax))
+        except Exception:
+            return False
 
     def create_hard_view(self):
         view = Path("/content/prompt1_hard_view")
@@ -411,6 +452,52 @@ class Prompt1Runner:
                 if self.hard_valid(case_id) and self.coarse_valid(case_id)
                 and self.gt_sdf_valid(case_id)]
 
+    def legacy_complete_cache_ids(self):
+        complete = []
+        for case_id in self.complete_cache_ids():
+            legacy = find_case_artifact(self.legacy_hard_dir, case_id)
+            active = self.hard_path(case_id)
+            if (legacy is not None and active is not None
+                    and legacy.resolve() == active.resolve()):
+                complete.append(case_id)
+        return complete
+
+    def bootstrap_legacy_provenance(self, case_ids):
+        case_ids = list(case_ids)
+        receipt_path = self.prompt_dir / "legacy_oof_provenance_bootstrap_receipt.json"
+        if receipt_path.is_file():
+            receipt = json.loads(receipt_path.read_text())
+            if receipt.get("pinned_git_sha") != self.git_sha:
+                raise RuntimeError("legacy bootstrap receipt belongs to another git SHA")
+            if receipt.get("case_ids") != case_ids:
+                raise RuntimeError("legacy bootstrap cohort changed after it was sealed")
+        completed = run_case_queue(
+            "provenance_bootstrap", case_ids, self.state,
+            lambda case_id: self._predict_case(
+                case_id, compare_existing=True,
+                verification="legacy_reprediction_voxelwise", force_softmax=True),
+            self.bootstrap_provenance_valid, self.fold_map, self.retry_failed)
+        failures = self.state.data.get("failed_cases", {}).get("provenance_bootstrap", {})
+        if completed != len(case_ids) or failures:
+            self.state.data["complete_cv"] = False
+            self.state.save()
+            raise RuntimeError(f"legacy OOF provenance bootstrap failed: {failures}")
+        provenance = self._provenance()["cases"]
+        records = {case_id: {
+            "prediction_fold": provenance[case_id]["prediction_fold"],
+            "source_checkpoint": provenance[case_id]["source_checkpoint"],
+            "source_checkpoint_sha256": provenance[case_id]["source_checkpoint_sha256"],
+            "artifact_type": provenance[case_id]["artifact_type"],
+            "legacy_hard_sha256": provenance[case_id]["legacy_hard_sha256"],
+            "reproduced_hard_sha256": provenance[case_id]["reproduced_hard_sha256"],
+            "softmax_sha256": provenance[case_id]["softmax_sha256"],
+            "legacy_changed_voxels": provenance[case_id]["legacy_changed_voxels"],
+        } for case_id in case_ids}
+        atomic_json(receipt_path, {
+            "pinned_git_sha": self.git_sha, "completed_at": utcnow(),
+            "case_ids": case_ids, "records": records})
+        print(f"[provenance-bootstrap] {len(case_ids)} legacy cases verified", flush=True)
+
     def preflight(self):
         receipt_path = self.prompt_dir / "identity_preflight_40_receipt.json"
         ids_path = self.prompt_dir / "identity_preflight_40_case_ids.json"
@@ -426,13 +513,16 @@ class Prompt1Runner:
         elif ids_path.is_file() and audit_json.is_file() and identity_json.is_file():
             ids = json.loads(ids_path.read_text())
         else:
-            ids = self.complete_cache_ids()
-            if len(ids) != 40:
+            candidates = self.legacy_complete_cache_ids()
+            if len(candidates) < 40:
                 raise RuntimeError(
-                    f"initial preflight requires exactly 40 complete cases; found {len(ids)}")
+                    "initial preflight requires at least 40 complete legacy oof_probs cases; "
+                    f"found {len(candidates)}")
+            ids = candidates[:40]
             atomic_json(ids_path, ids)
         if len(ids) != 40 or len(set(ids)) != 40:
             raise RuntimeError("preflight cohort receipt is not 40 unique cases")
+        self.bootstrap_legacy_provenance(ids)
         currently_complete = set(self.complete_cache_ids())
         incomplete = [case_id for case_id in ids if case_id not in currently_complete]
         if incomplete:
@@ -574,10 +664,12 @@ class Prompt1Runner:
         atomic_json(self.prompt_dir / "cache_manifest_480.json", payload)
         return payload
 
-    def _predict_case(self, case_id, compare_existing=False):
+    def _predict_case(self, case_id, compare_existing=False, verification=None,
+                      force_softmax=False):
         fold = self.fold_map[case_id]
         checkpoint = resolve_checkpoint(self.results, self.dataset_id, self.trainer,
                                         self.nn_config, fold)
+        checkpoint_sha = self._cached_sha256(checkpoint)
         local_root = Path("/content/prompt1_work")
         if not Path("/content").is_dir():
             local_root = Path(tempfile.gettempdir()) / "prompt1_work"
@@ -592,7 +684,8 @@ class Prompt1Runner:
                    "--images", str(self.images), "--out", str(hard_local),
                    "--device", self.device, "--fold", str(fold), "--case-id", case_id,
                    "--npp", str(self.workers), "--nps", str(self.workers)]
-            if self.export_softmax:
+            want_softmax = self.export_softmax or force_softmax
+            if want_softmax:
                 cmd += ["--save-probabilities", "--softmax-out", str(soft_local)]
             env = dict(os.environ)
             env["nnUNet_results"] = str(self.results)
@@ -607,8 +700,8 @@ class Prompt1Runner:
             existing = self.hard_path(case_id)
             if existing is not None and self.hard_valid(case_id):
                 _, old_mask, _ = load_oof(existing)
-                if compare_existing and not np.array_equal(local_mask, old_mask):
-                    raise ValueError(f"smoke prediction differs from existing hard OOF for {case_id}")
+                if compare_existing:
+                    assert_voxelwise_match(old_mask, local_mask, case_id)
                 hard_sha = sha256_file(existing)
             else:
                 target = self.hard_dir / f"{case_id}.npz"
@@ -616,7 +709,7 @@ class Prompt1Runner:
                                        replace_invalid=self.force and target.exists())
                 existing = target
             soft_sha, soft_target = None, None
-            if self.export_softmax:
+            if want_softmax:
                 produced_soft = soft_local / f"{case_id}.npz"
                 if not softmax_cache_is_valid(produced_soft):
                     raise ValueError(f"invalid local official softmax: {produced_soft}")
@@ -627,13 +720,36 @@ class Prompt1Runner:
                     soft_sha = atomic_copy(produced_soft, soft_target,
                                            replace_invalid=self.force and soft_target.exists())
             provenance = self._provenance()
-            provenance["cases"][case_id] = {
+            previous = provenance["cases"].get(case_id, {})
+            entry = {
                 "prediction_fold": fold, "source_checkpoint": checkpoint,
+                "source_checkpoint_sha256": checkpoint_sha,
                 "artifact_type": kind, "hard_artifact": str(existing),
                 "softmax_artifact": str(soft_target) if soft_target else None,
                 "hard_sha256": hard_sha, "softmax_sha256": soft_sha,
                 "predicted_at": utcnow(), "pinned_git_sha": self.git_sha,
             }
+            verification_keys = (
+                "verification_method", "legacy_voxelwise_match",
+                "legacy_changed_voxels", "legacy_hard_artifact",
+                "legacy_hard_sha256", "reproduced_hard_sha256", "verified_at")
+            if verification == "legacy_reprediction_voxelwise":
+                legacy = find_case_artifact(self.legacy_hard_dir, case_id)
+                if legacy is None or existing.resolve() != legacy.resolve():
+                    raise NonRetryableCaseError(
+                        f"legacy artifact is not the active hard OOF for {case_id}")
+                entry.update({
+                    "verification_method": verification,
+                    "legacy_voxelwise_match": True,
+                    "legacy_changed_voxels": 0,
+                    "legacy_hard_artifact": str(legacy),
+                    "legacy_hard_sha256": sha256_file(legacy),
+                    "reproduced_hard_sha256": sha256_file(produced_hard),
+                    "verified_at": utcnow(),
+                })
+            else:
+                entry.update({key: previous[key] for key in verification_keys if key in previous})
+            provenance["cases"][case_id] = entry
             self._write_provenance(provenance)
             return {"checksums": {"hard": hard_sha, "softmax": soft_sha},
                     "source_checkpoint": checkpoint, "fold": fold}

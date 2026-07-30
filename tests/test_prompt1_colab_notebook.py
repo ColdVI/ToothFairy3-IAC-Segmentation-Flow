@@ -30,6 +30,7 @@ def test_first_code_cell_is_the_single_editable_configuration():
     first_code = next(cell for cell in notebook["cells"] if cell["cell_type"] == "code")
     assert first_code["metadata"]["prompt1_group"] == "configuration"
     source = "".join(first_code["source"])
+    assert "dataset_cache_colab_v1/Dataset801_IAC_LR" in source
     assert "MAX_CASES = 2" in source
     assert "EXPORT_TRUE_SOFTMAX = True" in source
     assert "FORCE_REBUILD = False" in source
