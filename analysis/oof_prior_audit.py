@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -217,9 +218,11 @@ def audit_case(case_id, expected_fold, images, labels, hard_dir, softmax_dir,
         "gt": gt_spacing is not None and bool(np.allclose(gt_spacing, label_spacing, atol=1e-3)),
     }
     case_provenance = provenance.get(case_id, {})
-    source_fold = case_provenance.get("prediction_fold")
+    source_fold = case_provenance.get("expected_fold", case_provenance.get("prediction_fold"))
     source_checkpoint = case_provenance.get("source_checkpoint")
-    provenance_ok = source_fold == expected_fold and bool(source_checkpoint)
+    provenance_source = case_provenance.get("provenance_source")
+    provenance_ok = (source_fold == expected_fold and bool(source_checkpoint)
+                     and provenance_source in (None, "legacy_import", "runtime_prediction"))
 
     softmax_type = None
     softmax_stats = None
@@ -237,6 +240,9 @@ def audit_case(case_id, expected_fold, images, labels, hard_dir, softmax_dir,
         "expected_fold": expected_fold,
         "prediction_source_fold": source_fold,
         "source_checkpoint": source_checkpoint,
+        "provenance_source": provenance_source,
+        "exact_reproduction_claim": case_provenance.get("exact_reproduction_claim"),
+        "cross_runtime_validation": case_provenance.get("cross_runtime_validation"),
         "provenance_status": "valid" if provenance_ok else "missing_or_mismatch",
         "artifact_type": artifact_type,
         "hard_artifact_path": str(hard_path),
@@ -291,21 +297,24 @@ def _flatten_for_csv(row):
     }
 
 
-def write_reports(prefix, cases, legacy_adapter):
+def write_reports(prefix, cases, legacy_adapter, replace=False):
     prefix = Path(prefix)
     csv_path = prefix.parent / f"{prefix.name}_cases.csv"
     json_path = prefix.with_suffix(".json")
     md_path = prefix.with_suffix(".md")
     for path in (csv_path, json_path, md_path):
-        if path.exists():
+        if path.exists() and not replace:
             raise FileExistsError(f"refusing to overwrite existing audit report: {path}")
     counts = Counter(row["status"] for row in cases)
     types = Counter(row.get("artifact_type", "missing") for row in cases)
     provenance_errors = sum(row.get("provenance_status") != "valid" for row in cases)
+    split_leakage_errors = sum(
+        row.get("prediction_source_fold") != row.get("expected_fold") for row in cases)
     sdf_differences = sum((row.get("hard_vs_sdf_sign_voxel_difference") or 0) for row in cases)
     summary = {
         "total_cases": len(cases), "status_counts": dict(counts),
         "artifact_type_counts": dict(types), "provenance_errors": provenance_errors,
+        "split_leakage_errors": split_leakage_errors,
         "hard_vs_sdf_sign_voxel_difference": int(sdf_differences),
         "legacy_adapter": legacy_adapter,
         "contract": {"hard_directory": "oof_hard", "softmax_directory": "oof_softmax",
@@ -326,6 +335,7 @@ def write_reports(prefix, cases, legacy_adapter):
                 f"- Status: `{dict(counts)}`\n",
                 f"- Artifact types: `{dict(types)}`\n",
                 f"- Provenance errors: {provenance_errors}\n",
+                f"- Split leakage/fold assignment errors: {split_leakage_errors}\n",
                 f"- Hard vs SDF-sign changed voxels: {sdf_differences}\n",
                 f"- Legacy adapter: `{legacy_adapter}`\n\n",
                 "Hard/derived-one-hot artifacts are not calibrated probabilities.\n\n",
@@ -357,6 +367,9 @@ def main():
                         help="optional JSON list selecting an explicit audited cohort")
     parser.add_argument("--heartbeat-every", type=int, default=10)
     parser.add_argument("--progress-prefix", default=None)
+    parser.add_argument("--inventory", default=None,
+                        help="optional inventory used to invalidate changed resumed cases")
+    parser.add_argument("--replace-reports", action="store_true")
     args = parser.parse_args()
 
     with open(args.splits) as handle:
@@ -381,11 +394,27 @@ def main():
     if args.resume and state_path.is_file():
         state = json.loads(state_path.read_text())
     hard_dir = args.oof_hard or args.legacy_oof
+    inventory_cases = {}
+    inventory_git_sha = None
+    if args.inventory:
+        inventory = json.loads(Path(args.inventory).read_text())
+        inventory_cases = inventory.get("cases", {})
+        inventory_git_sha = inventory.get("pinned_git_sha")
+    state.setdefault("signatures", {})
     for index, case_id in enumerate(case_ids, start=1):
-        if args.resume and case_id in state["cases"]:
+        signature_payload = {
+            "inventory": inventory_cases.get(case_id),
+            "provenance": provenance.get(case_id),
+            "expected_fold": fold_map[case_id],
+            "pinned_git_sha": inventory_git_sha,
+        }
+        signature = hashlib.sha256(json.dumps(
+            signature_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (args.resume and case_id in state["cases"]
+                and state["signatures"].get(case_id) == signature):
             if (index % args.heartbeat_every == 0 or index == len(case_ids)):
-                prefix = args.progress_prefix or "[oof-audit]"
-                print(f"{prefix} {index}/{len(case_ids)}", flush=True)
+                progress = args.progress_prefix or "[oof-audit]"
+                print(f"{progress} {index}/{len(case_ids)}", flush=True)
             continue
         try:
             row = audit_case(case_id, fold_map[case_id], args.images, args.labels,
@@ -395,12 +424,14 @@ def main():
             row = {"case_id": case_id, "expected_fold": fold_map[case_id],
                    "status": "invalid", "error": f"{type(error).__name__}: {error}"}
         state["cases"][case_id] = row
+        state["signatures"][case_id] = signature
         atomic_json(state_path, state)
         if index % args.heartbeat_every == 0 or index == len(case_ids):
-            prefix = args.progress_prefix or "[oof-audit]"
-            print(f"{prefix} {index}/{len(case_ids)}", flush=True)
+            progress = args.progress_prefix or "[oof-audit]"
+            print(f"{progress} {index}/{len(case_ids)}", flush=True)
     cases = [state["cases"][case_id] for case_id in case_ids]
-    summary = write_reports(prefix, cases, legacy_adapter=bool(args.legacy_oof))
+    summary = write_reports(prefix, cases, legacy_adapter=bool(args.legacy_oof),
+                            replace=args.replace_reports)
     print(json.dumps(summary, indent=2))
 
 

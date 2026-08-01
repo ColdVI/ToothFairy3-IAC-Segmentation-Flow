@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -104,18 +105,23 @@ def evaluate_case_paths(case_id, expected_fold, images, labels, hard_dir,
     geometry = _cache_geometry(image_path, label_path, direct_mask.shape, coarse, gt_cache)
 
     case_provenance = provenance.get(case_id, {})
-    source_fold = case_provenance.get("prediction_fold")
+    source_fold = case_provenance.get("expected_fold", case_provenance.get("prediction_fold"))
     source_checkpoint = case_provenance.get("source_checkpoint")
+    provenance_source = case_provenance.get("provenance_source")
     provenance_checks = {
         "fold": source_fold == expected_fold,
         "checkpoint_recorded": bool(source_checkpoint),
         "checkpoint_exists": bool(source_checkpoint) and Path(source_checkpoint).is_file(),
         "artifact_type": case_provenance.get("artifact_type") in
                          (None, artifact_type),
+        "source": provenance_source in (None, "legacy_import", "runtime_prediction"),
     }
     result = {
         "case_id": case_id, "expected_fold": expected_fold,
         "prediction_source_fold": source_fold, "source_checkpoint": source_checkpoint,
+        "provenance_source": provenance_source,
+        "exact_reproduction_claim": case_provenance.get("exact_reproduction_claim"),
+        "cross_runtime_validation": case_provenance.get("cross_runtime_validation"),
         "artifact_type": artifact_type,
         "provenance_checks": provenance_checks,
         "provenance_valid": all(provenance_checks.values()),
@@ -210,13 +216,13 @@ def _csv_rows(cases):
             yield row
 
 
-def write_reports(prefix, cases, summary):
+def write_reports(prefix, cases, summary, replace=False):
     prefix = Path(prefix)
     csv_path = prefix.parent / f"{prefix.name}_cases.csv"
     json_path = prefix.with_suffix(".json")
     md_path = prefix.with_suffix(".md")
     for path in (csv_path, json_path, md_path):
-        if path.exists():
+        if path.exists() and not replace:
             raise FileExistsError(f"refusing to overwrite preflight report: {path}")
     rows = list(_csv_rows(cases))
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,6 +287,8 @@ def main():
     parser.add_argument("--out-prefix", default="outputs/baselines/identity_preflight_40")
     parser.add_argument("--state", default=None); parser.add_argument("--resume", action="store_true")
     parser.add_argument("--progress-prefix", default=None)
+    parser.add_argument("--inventory", default=None)
+    parser.add_argument("--replace-reports", action="store_true")
     args = parser.parse_args()
 
     splits = json.loads(Path(args.splits).read_text())
@@ -301,20 +309,35 @@ def main():
     state = {"cases": {}}
     if args.resume and state_path.is_file():
         state = json.loads(state_path.read_text())
+    state.setdefault("signatures", {})
+    inventory_cases = {}
+    inventory_git_sha = None
+    if args.inventory:
+        inventory = json.loads(Path(args.inventory).read_text())
+        inventory_cases = inventory.get("cases", {})
+        inventory_git_sha = inventory.get("pinned_git_sha")
     for index, case_id in enumerate(case_ids, start=1):
-        if args.resume and case_id in state["cases"]:
-            prefix = args.progress_prefix or "[identity-preflight]"
-            print(f"{prefix} {index}/{len(case_ids)} {case_id}", flush=True)
+        signature = hashlib.sha256(json.dumps({
+            "inventory": inventory_cases.get(case_id),
+            "provenance": provenance.get(case_id),
+            "expected_fold": folds[case_id],
+            "pinned_git_sha": inventory_git_sha}, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()
+        if (args.resume and case_id in state["cases"]
+                and state["signatures"].get(case_id) == signature):
+            progress = args.progress_prefix or "[identity-preflight]"
+            print(f"{progress} {index}/{len(case_ids)} {case_id}", flush=True)
             continue
         state["cases"][case_id] = evaluate_case_paths(
             case_id, folds[case_id], args.images, args.labels, directories["hard"],
             args.coarse_sdf, args.gt_sdf, provenance, args.patch, args.steps, args.device)
+        state["signatures"][case_id] = signature
         atomic_json(state_path, state)
-        prefix = args.progress_prefix or "[identity-preflight]"
-        print(f"{prefix} {index}/{len(case_ids)} {case_id}", flush=True)
+        progress = args.progress_prefix or "[identity-preflight]"
+        print(f"{progress} {index}/{len(case_ids)} {case_id}", flush=True)
     cases = [state["cases"][case_id] for case_id in case_ids]
     summary = summarize(cases, args.expected_cases)
-    write_reports(prefix, cases, summary)
+    write_reports(prefix, cases, summary, replace=args.replace_reports)
     print(json.dumps(summary, indent=2))
     if summary["decision"] != "PASS":
         raise SystemExit(f"identity preflight failed: {summary['decision']}")

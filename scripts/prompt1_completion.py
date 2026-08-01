@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Drive-backed, case-resumable completion runner for the Prompt-1 barrier.
+"""Drive-backed, stage- and case-resumable runner for the Prompt-1 barrier.
 
-This script never trains Track A or Track B. It reuses frozen fold checkpoints
-for leakage-free OOF inference, completes physical-SDF caches, validates all 480
-development cases, and measures the three-path identity baseline. Persistent
-artifacts are published through ``.partial`` files and state is saved per case.
+The acceptance path inventories legacy hard OOF artifacts, imports their fold
+and checkpoint provenance without claiming exact cross-runtime reproduction,
+completes only missing/invalid physical-SDF caches, audits all 480 development
+cases, and measures the three-path identity baseline. It never trains Track A
+or Track B, never modifies legacy hard artifacts, and does not require true
+softmax for identity acceptance.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,11 +43,14 @@ from data.compute_gt_sdf import (cache_is_valid as gt_cache_is_valid,  # noqa: E
                                  compute_one as compute_gt_one)
 from data.io_utils import sdf_stack_to_mask, voxel_spacing  # noqa: E402
 from nnunet.predict_oof import (cache_is_valid as hard_cache_is_valid,  # noqa: E402
-                                resolve_checkpoint, softmax_cache_is_valid)
+                                predict_fold, resolve_checkpoint,
+                                softmax_cache_is_valid)
 
 EXPECTED_CASES = 480
 MAX_AUTOMATIC_RETRIES = 2
 HEARTBEAT_EVERY = 10
+CROSS_RUNTIME_CHANGED_VOXELS = {0: 3, 1: 1, 2: 6, 3: 2, 4: 2}
+INVENTORY_SCHEMA_VERSION = 1
 
 
 class NonRetryableCaseError(RuntimeError):
@@ -78,6 +84,93 @@ def sha256_file(path, block_size=8 * 1024 * 1024):
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def _read_inventory_metadata(path, kind):
+    path = Path(path)
+    if kind in ("image", "label"):
+        image = nib.load(str(path))
+        shape = list(image.shape)
+        if len(shape) != 3:
+            raise ValueError(f"{kind} must be 3-D, got {shape}")
+        return {"shape": shape, "spacing": voxel_spacing(image).tolist(),
+                "affine": np.asarray(image.affine).tolist(), "artifact_type": "nifti"}
+    if kind == "hard_oof":
+        probs, hard, artifact_type = load_oof(path)
+        if artifact_type not in ("hard_segmentation", "derived_one_hot"):
+            raise ValueError(f"hard OOF has unsupported artifact type: {artifact_type}")
+        if hard.ndim != 3 or not np.isfinite(probs).all():
+            raise ValueError(f"invalid hard OOF array: {hard.shape}")
+        return {"shape": list(hard.shape), "spacing": None, "affine": None,
+                "artifact_type": artifact_type}
+    if kind not in ("coarse_sdf", "gt_sdf"):
+        raise ValueError(f"unknown inventory kind: {kind}")
+    validator = coarse_cache_is_valid if kind == "coarse_sdf" else gt_cache_is_valid
+    if not validator(path):
+        raise ValueError(f"invalid {kind} cache structure")
+    with np.load(path) as item:
+        sdf = item["sdf"]
+        if not np.isfinite(sdf).all():
+            raise ValueError(f"{kind} contains non-finite values")
+        spacing = item.get("spacing")
+        return {"shape": list(sdf.shape),
+                "spacing": None if spacing is None else np.asarray(spacing).tolist(),
+                "affine": None, "artifact_type": "physical_mm_sdf"}
+
+
+def inventory_file_record(path, kind, previous=None, metadata_reader=None):
+    """Return cached file metadata, reopening content only when stat data changed."""
+    if path is None:
+        return {"status": "missing", "path": None, "kind": kind}
+    path = Path(path)
+    if not path.is_file():
+        return {"status": "missing", "path": str(path), "kind": kind}
+    stat = path.stat()
+    if (previous and previous.get("path") == str(path)
+            and previous.get("size_bytes") == stat.st_size
+            and previous.get("mtime_ns") == stat.st_mtime_ns
+            and previous.get("sha256")):
+        return previous
+    record = {
+        "status": "valid", "path": str(path), "kind": kind,
+        "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+        "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        "sha256": sha256_file(path),
+    }
+    try:
+        reader = metadata_reader or _read_inventory_metadata
+        record.update(reader(path, kind))
+    except Exception as error:
+        record.update({"status": "invalid", "shape": None, "spacing": None,
+                       "affine": None, "artifact_type": None,
+                       "error": f"{type(error).__name__}: {error}"})
+    return record
+
+
+def _compute_staged_sdf_job(job):
+    """Compute the missing SDF artifacts for one already-staged case."""
+    (case_id, labels_dir, hard_dir, output_dir, need_gt, need_coarse,
+     prob_threshold, clip_mm) = job
+    output_dir = Path(output_dir)
+    result = {"case_id": case_id, "gt_sdf": None, "coarse_sdf": None}
+    if need_gt:
+        gt_out = output_dir / "gt"
+        gt_out.mkdir(parents=True, exist_ok=True)
+        _, produced, _ = compute_gt_one(
+            (str(labels_dir), f"{case_id}.nii.gz", str(gt_out), clip_mm))
+        if not gt_cache_is_valid(produced):
+            raise ValueError(f"local GT SDF validation failed for {case_id}")
+        result["gt_sdf"] = str(produced)
+    if need_coarse:
+        coarse_out = output_dir / "coarse"
+        coarse_out.mkdir(parents=True, exist_ok=True)
+        _, produced, _ = compute_coarse_one(
+            (str(hard_dir), str(labels_dir), f"{case_id}.npz",
+             str(coarse_out), prob_threshold, clip_mm))
+        if not coarse_cache_is_valid(produced):
+            raise ValueError(f"local coarse SDF validation failed for {case_id}")
+        result["coarse_sdf"] = str(produced)
+    return result
 
 
 def atomic_copy(source, destination, replace_invalid=False):
@@ -277,7 +370,16 @@ class Prompt1Runner:
         self.prompt_dir = self.output_root / "prompt1"
         self.analysis_dir = self.output_root / "analysis"
         self.baseline_dir = self.output_root / "baselines"
-        self.state_path = self.output_root / "prompt1_completion_state.json"
+        self.state_path = None
+        self.inventory_path = self.prompt_dir / "cache_inventory_480.json"
+        self.inventory_receipt_path = self.prompt_dir / "cache_inventory_480_receipt.json"
+        self.legacy_import_path = self.prompt_dir / "legacy_provenance_import_manifest.json"
+        self.legacy_import_receipt_path = self.prompt_dir / "legacy_provenance_import_receipt.json"
+        self.audit_480_path = self.analysis_dir / "oof_prior_audit_480.json"
+        self.audit_480_receipt_path = self.prompt_dir / "oof_prior_audit_480_receipt.json"
+        self.sdf_receipt_path = self.prompt_dir / "complete_missing_sdf_receipt.json"
+        self.identity_480_receipt_path = self.prompt_dir / "identity_480_receipt.json"
+        self.final_receipt_path = self.prompt_dir / "finalize_prompt1_receipt.json"
         for directory in (self.hard_dir, self.softmax_dir, self.coarse_dir,
                           self.gt_sdf_dir, self.prompt_dir, self.analysis_dir,
                           self.baseline_dir):
@@ -305,12 +407,15 @@ class Prompt1Runner:
         self.quick_cases_per_fold = int(config.get("QUICK_PREFLIGHT_CASES_PER_FOLD", 1))
         self.full_preflight_cases = int(config.get("FULL_PREFLIGHT_CASES", 40))
         self.preflight_mode = str(config.get("PREFLIGHT_MODE", "quick")).lower()
+        self.sdf_batch_size = int(config.get("SDF_BATCH_SIZE", 12))
         if self.quick_cases_per_fold < 1:
             raise ValueError("QUICK_PREFLIGHT_CASES_PER_FOLD must be positive")
         if self.full_preflight_cases < 1:
             raise ValueError("FULL_PREFLIGHT_CASES must be positive")
         if self.preflight_mode not in ("quick", "full"):
             raise ValueError("PREFLIGHT_MODE must be 'quick' or 'full'")
+        if not 8 <= self.sdf_batch_size <= 16:
+            raise ValueError("SDF_BATCH_SIZE must be between 8 and 16")
         self.dataset_id = int(config.get("NNUNET_DATASET_ID", 801))
         self.nn_config = config.get("NNUNET_CONFIG", "3d_fullres")
         self.trainer = config.get("NNUNET_TRAINER", "nnUNetTrainerIAC_NoMirror")
@@ -321,6 +426,10 @@ class Prompt1Runner:
         if current_sha != expected_sha:
             raise ValueError(f"repository SHA {current_sha} != pinned SHA {expected_sha}")
         self.git_sha = current_sha
+        # Namespace orchestration state by code SHA. Persistent case artifacts
+        # and signature-aware audit/identity state still resume across sessions,
+        # while an older runner state cannot block a code migration.
+        self.state_path = self.prompt_dir / f"prompt1_stage_state_{current_sha[:12]}.json"
         self.state = CompletionState(self.state_path, current_sha, self.device,
                                      config.get("COLAB_SESSION_IDENTIFIER"))
         self._stop_requested = False
@@ -348,9 +457,223 @@ class Prompt1Runner:
         payload["updated_at"] = utcnow()
         atomic_json(self.provenance_path, payload)
 
+    @staticmethod
+    def _load_stage_json(path, name):
+        path = Path(path)
+        if not path.is_file():
+            raise RuntimeError(f"{name} artifact is missing: {path}")
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"{name} artifact is unreadable: {path}: {error}") from error
+
+    def _write_stage_receipt(self, path, stage, inputs, artifacts, summary=None):
+        records = {}
+        for name, artifact in artifacts.items():
+            artifact = Path(artifact)
+            if not artifact.is_file():
+                raise RuntimeError(f"{stage} output is missing: {artifact}")
+            records[name] = {"path": str(artifact), "sha256": sha256_file(artifact)}
+        payload = {"stage": stage, "pinned_git_sha": self.git_sha,
+                   "completed_at": utcnow(), "inputs": inputs,
+                   "artifacts": records, "summary": summary or {}}
+        path = Path(path)
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text())
+                comparable = dict(existing)
+                comparable.pop("completed_at", None)
+                expected = dict(payload)
+                expected.pop("completed_at", None)
+                if comparable == expected and self._receipt_valid(path, inputs):
+                    return existing
+            except Exception:
+                pass
+        atomic_json(path, payload)
+        return payload
+
+    def _receipt_valid(self, path, inputs=None):
+        path = Path(path)
+        if not path.is_file():
+            return False
+        try:
+            receipt = json.loads(path.read_text())
+            if receipt.get("pinned_git_sha") != self.git_sha:
+                return False
+            if inputs is not None and receipt.get("inputs") != inputs:
+                return False
+            for record in receipt.get("artifacts", {}).values():
+                artifact = Path(record["path"])
+                if not artifact.is_file() or sha256_file(artifact) != record.get("sha256"):
+                    return False
+            return bool(receipt.get("artifacts"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _inventory_geometry(files):
+        image, label = files["image"], files["label"]
+        hard, coarse, gt = files["hard_oof"], files["coarse_sdf"], files["gt_sdf"]
+        def same(left, right, atol=1e-3):
+            return (left is not None and right is not None
+                    and bool(np.allclose(left, right, atol=atol)))
+        label_shape = label.get("shape")
+        checks = {
+            "image_label_shape": image.get("shape") == label_shape and label_shape is not None,
+            "image_label_spacing": same(image.get("spacing"), label.get("spacing")),
+            "image_label_affine": same(image.get("affine"), label.get("affine")),
+            "hard_shape": hard.get("shape") == label_shape and label_shape is not None,
+            "coarse_shape": (coarse.get("shape", [None])[1:] == label_shape
+                             if coarse.get("shape") else False),
+            "gt_sdf_shape": (gt.get("shape", [None])[1:] == label_shape
+                             if gt.get("shape") else False),
+            "coarse_spacing": same(coarse.get("spacing"), label.get("spacing")),
+            "gt_sdf_spacing": same(gt.get("spacing"), label.get("spacing")),
+        }
+        return {"checks": checks, "valid": all(checks.values())}
+
+    def build_inventory(self):
+        previous = (json.loads(self.inventory_path.read_text())
+                    if self.inventory_path.is_file() else {})
+        previous_cases = previous.get("cases", {})
+        cases = {}
+        status_counts = {"valid": 0, "missing": 0, "invalid": 0}
+        for index, case_id in enumerate(self.case_ids, start=1):
+            old_files = previous_cases.get(case_id, {}).get("files", {})
+            paths = {
+                "image": self.images / f"{case_id}_0000.nii.gz",
+                "label": self.labels / f"{case_id}.nii.gz",
+                "hard_oof": self.hard_path(case_id),
+                "coarse_sdf": self.coarse_dir / f"{case_id}.npz",
+                "gt_sdf": self.gt_sdf_dir / f"{case_id}.npz",
+            }
+            files = {name: inventory_file_record(path, name, old_files.get(name))
+                     for name, path in paths.items()}
+            geometry = self._inventory_geometry(files)
+            file_statuses = {record["status"] for record in files.values()}
+            if "missing" in file_statuses:
+                status = "missing"
+            elif "invalid" in file_statuses or not geometry["valid"]:
+                status = "invalid"
+            else:
+                status = "valid"
+            status_counts[status] += 1
+            cases[case_id] = {"case_id": case_id,
+                              "expected_fold": self.fold_map[case_id],
+                              "status": status, "files": files,
+                              "geometry": geometry}
+            if index % HEARTBEAT_EVERY == 0 or index == len(self.case_ids):
+                self.state.data["current_stage"] = "build_inventory"
+                self.state.data["last_heartbeat"] = {
+                    "at": utcnow(), "stage": "build_inventory",
+                    "completed_in_queue": index, "queue_size": len(self.case_ids)}
+                self.state.save()
+                print(f"[inventory] {index}/{len(self.case_ids)}", flush=True)
+        summary = {"total_cases": len(cases), "status_counts": status_counts,
+                   "external_s_cases": len(set(cases) & set(self.splits.get("external_test", [])))}
+        stable = (previous.get("schema_version") == INVENTORY_SCHEMA_VERSION
+                  and previous.get("pinned_git_sha") == self.git_sha
+                  and previous.get("splits_sha256") == sha256_file(self.splits_path)
+                  and previous.get("cases") == cases and previous.get("summary") == summary)
+        if stable:
+            payload = previous
+        else:
+            payload = {"schema_version": INVENTORY_SCHEMA_VERSION,
+                       "created_at": utcnow(), "pinned_git_sha": self.git_sha,
+                       "splits_path": str(self.splits_path),
+                       "splits_sha256": sha256_file(self.splits_path),
+                       "summary": summary, "cases": cases}
+            atomic_json(self.inventory_path, payload)
+        self._write_stage_receipt(
+            self.inventory_receipt_path, "build-inventory",
+            {"splits_sha256": sha256_file(self.splits_path)},
+            {"inventory": self.inventory_path}, summary)
+        return payload
+
+    @staticmethod
+    def _legacy_import_entry(case_id, fold, hard_path, hard_sha,
+                             checkpoint_path, checkpoint_sha):
+        changed = CROSS_RUNTIME_CHANGED_VOXELS[fold]
+        return {
+            "case_id": case_id, "expected_fold": fold,
+            "fold_semantics": "expected_validation_fold_from_splits",
+            "source_checkpoint": str(checkpoint_path),
+            "source_checkpoint_sha256": checkpoint_sha,
+            "artifact_type": "derived_one_hot", "hard_artifact": str(hard_path),
+            "hard_sha256": hard_sha, "provenance_source": "legacy_import",
+            "verification_method": "legacy_import_from_split_and_checkpoint_inventory",
+            "exact_reproduction_claim": False,
+            "cross_runtime_validation": {
+                "reference_runtime": "A100_legacy", "diagnostic_runtime": "L4_smoke",
+                "interpretation": "cross_runtime_near_exact_diagnostic",
+                "changed_voxels": changed},
+        }
+
+    def import_legacy_provenance(self):
+        inventory = self.build_inventory()
+        checkpoints = {}
+        for fold in range(len(self.splits["folds"])):
+            checkpoint = resolve_checkpoint(self.results, self.dataset_id, self.trainer,
+                                            self.nn_config, fold)
+            checkpoints[fold] = (checkpoint, self._cached_sha256(checkpoint))
+        cases, missing = {}, []
+        for case_id in self.case_ids:
+            fold = self.fold_map[case_id]
+            legacy = find_case_artifact(self.legacy_hard_dir, case_id)
+            if legacy is None:
+                missing.append(case_id)
+                continue
+            hard_record = inventory["cases"][case_id]["files"]["hard_oof"]
+            hard_sha = (hard_record.get("sha256") if hard_record.get("path") == str(legacy)
+                        else sha256_file(legacy))
+            cases[case_id] = self._legacy_import_entry(
+                case_id, fold, legacy, hard_sha, *checkpoints[fold])
+        cross_runtime = {
+            "status": "near_exact", "exact_reproduction_claim": False,
+            "interpretation": "cross_runtime_near_exact_diagnostic",
+            "per_fold_changed_voxels": {str(k): v for k, v in CROSS_RUNTIME_CHANGED_VOXELS.items()},
+            "total_changed_voxels": sum(CROSS_RUNTIME_CHANGED_VOXELS.values()),
+        }
+        core = {"contract_version": 2,
+                "pinned_git_sha": self.git_sha, "provenance_source": "legacy_import",
+                   "splits_path": str(self.splits_path),
+                   "splits_sha256": sha256_file(self.splits_path),
+                   "exact_reproduction_claim": False,
+                   "cross_runtime_validation": cross_runtime,
+                   "summary": {"development_cases": len(self.case_ids),
+                               "imported_cases": len(cases),
+                               "missing_legacy_cases": len(missing),
+                               "missing_legacy_case_ids": missing},
+                   "cases": cases}
+        previous = (json.loads(self.legacy_import_path.read_text())
+                    if self.legacy_import_path.is_file() else None)
+        if previous and {k: v for k, v in previous.items() if k != "created_at"} == core:
+            payload = previous
+        else:
+            payload = {"created_at": utcnow(), **core}
+            atomic_json(self.legacy_import_path, payload)
+        if (not self.provenance_path.is_file()
+                or json.loads(self.provenance_path.read_text()) != payload):
+            atomic_json(self.provenance_path, payload)
+        legacy_input_sha = hashlib.sha256(json.dumps(
+            {case_id: {"hard_sha256": entry["hard_sha256"],
+                       "checkpoint_sha256": entry["source_checkpoint_sha256"]}
+             for case_id, entry in cases.items()},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        inputs = {"legacy_hard_and_checkpoint_sha256": legacy_input_sha,
+                  "splits_sha256": sha256_file(self.splits_path)}
+        self._write_stage_receipt(
+            self.legacy_import_receipt_path, "import-legacy-provenance", inputs,
+            {"import_manifest": self.legacy_import_path,
+             "active_provenance_manifest": self.provenance_path}, payload["summary"])
+        print(f"[legacy-import] {len(cases)}/{len(self.case_ids)} cases; "
+              f"cross-runtime changed voxels={sum(CROSS_RUNTIME_CHANGED_VOXELS.values())}",
+              flush=True)
+        return payload
+
     def hard_path(self, case_id):
-        return (find_case_artifact(self.hard_dir, case_id)
-                or find_case_artifact(self.legacy_hard_dir, case_id))
+        return (find_case_artifact(self.legacy_hard_dir, case_id)
+                or find_case_artifact(self.hard_dir, case_id))
 
     def _label_geometry(self, case_id):
         image_path = self.images / f"{case_id}_0000.nii.gz"
@@ -431,7 +754,10 @@ class Prompt1Runner:
             _, _, actual_type = load_oof(actual)
         except Exception:
             return False
-        return (case.get("prediction_fold") == self.fold_map[case_id]
+        fold_matches = (case.get("expected_fold", case.get("prediction_fold"))
+                        == self.fold_map[case_id])
+        source_valid = case.get("provenance_source") in (None, "legacy_import", "runtime_prediction")
+        return (fold_matches and source_valid
                 and bool(checkpoint) and Path(checkpoint).is_file()
                 and case.get("artifact_type") == actual_type
                 and actual_type in ("hard_segmentation", "derived_one_hot")
@@ -707,6 +1033,41 @@ class Prompt1Runner:
     def preflight(self):
         return self.preflight_quick() if self.preflight_mode == "quick" else self.preflight_full()
 
+    def audit_480(self):
+        inventory = self._load_stage_json(self.inventory_path, "cache inventory")
+        provenance = self._load_stage_json(self.provenance_path, "legacy provenance import")
+        inputs = {"inventory_sha256": sha256_file(self.inventory_path),
+                  "provenance_sha256": sha256_file(self.provenance_path),
+                  "splits_sha256": sha256_file(self.splits_path)}
+        if self._receipt_valid(self.audit_480_receipt_path, inputs):
+            return self._load_stage_json(self.audit_480_path, "480-case OOF audit")
+        prefix = self.audit_480_path.with_suffix("")
+        cmd = [sys.executable, str(ROOT / "analysis/oof_prior_audit.py"),
+               "--splits", str(self.splits_path), "--images", str(self.images),
+               "--labels", str(self.labels), "--legacy-oof", str(self.legacy_hard_dir),
+               "--oof-softmax", str(self.softmax_dir), "--coarse-sdf", str(self.coarse_dir),
+               "--gt-sdf", str(self.gt_sdf_dir),
+               "--provenance-manifest", str(self.provenance_path),
+               "--inventory", str(self.inventory_path), "--out-prefix", str(prefix),
+               "--state", str(self.prompt_dir / "oof_prior_audit_480_state.json"),
+               "--heartbeat-every", "10", "--resume", "--replace-reports"]
+        subprocess.run(cmd, cwd=ROOT, check=True)
+        payload = self._load_stage_json(self.audit_480_path, "480-case OOF audit")
+        summary = payload.get("summary", {})
+        if summary.get("total_cases") != EXPECTED_CASES:
+            raise RuntimeError(
+                f"audit-480 evaluated {summary.get('total_cases')} cases, expected {EXPECTED_CASES}")
+        if inventory.get("summary", {}).get("external_s_cases") != 0:
+            raise RuntimeError("audit inventory contains external S-cohort cases")
+        if provenance.get("summary", {}).get("development_cases") != EXPECTED_CASES:
+            raise RuntimeError("legacy provenance import is not the 480-case development cohort")
+        self._write_stage_receipt(
+            self.audit_480_receipt_path, "audit-480", inputs,
+            {"audit_json": self.audit_480_path,
+             "audit_csv": prefix.parent / f"{prefix.name}_cases.csv",
+             "audit_report": prefix.with_suffix(".md")}, summary)
+        return payload
+
     def _cached_sha256(self, path):
         path = Path(path)
         stat = path.stat()
@@ -896,6 +1257,41 @@ class Prompt1Runner:
             return {"checksums": {"hard": hard_sha, "softmax": soft_sha},
                     "source_checkpoint": checkpoint, "fold": fold}
 
+    def _predict_softmax_fold(self, fold, case_ids):
+        case_ids = list(case_ids)
+        if not case_ids:
+            return
+        local_root = Path("/content/prompt1_softmax_work")
+        if not Path("/content").is_dir():
+            local_root = Path(tempfile.gettempdir()) / "prompt1_softmax_work"
+        local_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=local_root) as hard_output:
+            previous_results = os.environ.get("nnUNet_results")
+            os.environ["nnUNet_results"] = str(self.results)
+            try:
+                predict_fold(
+                    fold, case_ids, str(self.images), self.dataset_id, self.nn_config,
+                    self.trainer, hard_output, self.device, npp=self.workers,
+                    nps=self.workers, save_probabilities=True,
+                    softmax_out=str(self.softmax_dir))
+            finally:
+                if previous_results is None:
+                    os.environ.pop("nnUNet_results", None)
+                else:
+                    os.environ["nnUNet_results"] = previous_results
+        invalid = [case_id for case_id in case_ids if not self.softmax_valid(case_id)]
+        if invalid:
+            raise RuntimeError(f"fold {fold} softmax batch left invalid cases: {invalid[:5]}")
+
+    def complete_true_softmax_by_fold(self):
+        """Optional future queue: load the predictor only once per missing fold."""
+        for fold, split in enumerate(self.splits["folds"]):
+            missing = [case_id for case_id in split["val"]
+                       if not self.softmax_valid(case_id)]
+            if missing:
+                print(f"[softmax] fold={fold} missing={len(missing)}", flush=True)
+                self._predict_softmax_fold(fold, missing)
+
     def run_smoke_oof(self, smoke_ids):
         smoke_ids = list(smoke_ids)
         completed = run_case_queue(
@@ -978,6 +1374,119 @@ class Prompt1Runner:
             "sdf", queue, self.state, self._compute_sdf_case,
             lambda case_id: self.coarse_valid(case_id) and self.gt_sdf_valid(case_id),
             self.fold_map, self.retry_failed)
+
+    def _sdf_worker_count(self):
+        configured = self.config.get("SDF_WORKERS")
+        if configured is not None:
+            return max(1, int(configured))
+        cores = os.cpu_count() or 2
+        return max(1, min(8, cores // 2))
+
+    def complete_missing_sdf(self):
+        inventory = self.build_inventory()
+        audited_cases = {}
+        if self.audit_480_path.is_file():
+            audited_cases = self._load_stage_json(
+                self.audit_480_path, "480-case OOF audit").get("cases", {})
+            if isinstance(audited_cases, list):
+                audited_cases = {row["case_id"]: row for row in audited_cases}
+        selected = []
+        for case_id in self.case_ids:
+            inventory_case = inventory["cases"][case_id]
+            files = inventory_case["files"]
+            checks = inventory_case["geometry"]["checks"]
+            audit_case = audited_cases.get(case_id, {})
+            need_coarse = (files["coarse_sdf"]["status"] != "valid"
+                           or not checks["coarse_shape"] or not checks["coarse_spacing"]
+                           or (audit_case.get("hard_vs_sdf_sign_voxel_difference") or 0) != 0)
+            need_gt = (files["gt_sdf"]["status"] != "valid"
+                       or not checks["gt_sdf_shape"] or not checks["gt_sdf_spacing"])
+            if need_coarse or need_gt:
+                if files["label"]["status"] != "valid":
+                    raise RuntimeError(f"cannot complete SDF without valid label: {case_id}")
+                if need_coarse and files["hard_oof"]["status"] != "valid":
+                    raise RuntimeError(f"cannot complete coarse SDF without valid hard OOF: {case_id}")
+                selected.append((case_id, need_gt, need_coarse))
+        current_inputs = {"final_inventory_sha256": sha256_file(self.inventory_path)}
+        if not selected and self._receipt_valid(self.sdf_receipt_path, current_inputs):
+            return json.loads(self.sdf_receipt_path.read_text()).get("summary", {})
+        stage = "complete_missing_sdf"
+        for case_id in list(self.state.data.get("failed_cases", {}).get(stage, {})):
+            if self.coarse_valid(case_id) and self.gt_sdf_valid(case_id):
+                self.state.complete(stage, case_id, {"status": "reconciled_valid"})
+        workers = self._sdf_worker_count()
+        local_root = Path("/content/prompt1_sdf_stage")
+        if not Path("/content").is_dir():
+            local_root = Path(tempfile.gettempdir()) / "prompt1_sdf_stage"
+        local_root.mkdir(parents=True, exist_ok=True)
+        completed = 0
+        for batch_start in range(0, len(selected), self.sdf_batch_size):
+            batch = selected[batch_start:batch_start + self.sdf_batch_size]
+            with tempfile.TemporaryDirectory(dir=local_root) as temporary:
+                temporary = Path(temporary)
+                staged_labels = temporary / "labels"
+                staged_hard = temporary / "hard"
+                staged_output = temporary / "output"
+                staged_labels.mkdir(); staged_hard.mkdir(); staged_output.mkdir()
+                jobs = []
+                for case_id, need_gt, need_coarse in batch:
+                    shutil.copy2(self.labels / f"{case_id}.nii.gz",
+                                 staged_labels / f"{case_id}.nii.gz")
+                    if need_coarse:
+                        source = self.hard_path(case_id)
+                        local_hard = staged_hard / f"{case_id}.npz"
+                        if source.name.endswith(".npz"):
+                            shutil.copy2(source, local_hard)
+                        else:
+                            _, hard_mask, _ = load_oof(source)
+                            np.savez_compressed(
+                                local_hard,
+                                prob_left=(hard_mask == 1).astype(np.float16),
+                                prob_right=(hard_mask == 2).astype(np.float16))
+                    jobs.append((case_id, staged_labels, staged_hard, staged_output,
+                                 need_gt, need_coarse, 0.5, 10.0))
+                print(f"[complete-missing-sdf] staged batch "
+                      f"{batch_start // self.sdf_batch_size + 1}: {len(batch)} cases | "
+                      f"workers={workers}", flush=True)
+                with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as executor:
+                    futures = {executor.submit(_compute_staged_sdf_job, job): job[0]
+                               for job in jobs}
+                    for future in as_completed(futures):
+                        case_id = futures[future]
+                        self.state.begin(stage, case_id, self.fold_map[case_id])
+                        try:
+                            result = future.result()
+                            checksums = {}
+                            if result["gt_sdf"]:
+                                target = self.gt_sdf_dir / f"{case_id}.npz"
+                                checksums["gt_sdf"] = atomic_copy(
+                                    result["gt_sdf"], target, replace_invalid=target.exists())
+                            if result["coarse_sdf"]:
+                                target = self.coarse_dir / f"{case_id}.npz"
+                                checksums["coarse_sdf"] = atomic_copy(
+                                    result["coarse_sdf"], target, replace_invalid=target.exists())
+                            if not (self.coarse_valid(case_id) and self.gt_sdf_valid(case_id)):
+                                raise ValueError(f"published SDF validation failed for {case_id}")
+                            self.state.complete(stage, case_id, {"checksums": checksums})
+                            completed += 1
+                            print(f"[complete-missing-sdf] {completed}/{len(selected)} "
+                                  f"{case_id}", flush=True)
+                        except Exception as error:
+                            self.state.fail(stage, case_id, error)
+                            print(f"[complete-missing-sdf] FAILED {case_id}: {error}", flush=True)
+        unresolved = [case_id for case_id, _, _ in selected if not (
+            self.coarse_valid(case_id) and self.gt_sdf_valid(case_id))]
+        if unresolved:
+            raise RuntimeError(f"SDF completion left invalid cases: {unresolved[:10]}")
+        final_inventory = self.build_inventory()
+        inputs = {"final_inventory_sha256": sha256_file(self.inventory_path)}
+        summary = {"requested_cases": len(selected), "completed_cases": completed,
+                   "batch_size": self.sdf_batch_size, "workers": workers,
+                   "inventory_status_counts": final_inventory["summary"]["status_counts"]}
+        self._write_stage_receipt(
+            self.sdf_receipt_path, "complete-missing-sdf", inputs,
+            {"inventory": self.inventory_path}, summary)
+        return summary
 
     def _validate_smoke_cases(self, case_ids):
         invalid = [case_id for case_id in case_ids if not (
@@ -1089,6 +1598,183 @@ class Prompt1Runner:
             for row in case_rows)
         return payload, export_rows, folds
 
+    def _validate_final_audit(self):
+        audit = self._load_stage_json(self.audit_480_path, "480-case OOF audit")
+        summary = audit.get("summary", {})
+        if summary.get("total_cases") != EXPECTED_CASES:
+            raise RuntimeError(
+                f"final audit requires {EXPECTED_CASES} cases, got {summary.get('total_cases')}")
+        if summary.get("status_counts") != {"valid": EXPECTED_CASES}:
+            raise RuntimeError(
+                f"final audit does not have {EXPECTED_CASES} valid cases: "
+                f"{summary.get('status_counts')}")
+        if summary.get("provenance_errors", 0) != 0:
+            raise RuntimeError(f"final audit has provenance errors: {summary['provenance_errors']}")
+        if summary.get("split_leakage_errors", 0) != 0:
+            raise RuntimeError(
+                f"final audit has split leakage errors: {summary['split_leakage_errors']}")
+        if summary.get("hard_vs_sdf_sign_voxel_difference", 0) != 0:
+            raise RuntimeError("final audit hard-to-SDF round-trip changed voxels")
+        return audit
+
+    def _write_identity_report(self, payload, finalized=False):
+        report = ["# Full-CV identity prior\n\n",
+                  f"- complete_cv: `{payload.get('complete_cv', False)}`\n",
+                  f"- identity_complete: `{payload.get('identity_complete', False)}`\n",
+                  f"- cases: {payload.get('evaluated_cases')}/{EXPECTED_CASES}\n",
+                  f"- provenance: `legacy_import`\n",
+                  f"- cross-runtime diagnostic: `near_exact`, exact reproduction claim: `false`\n",
+                  f"- direct vs SDF changed voxels: "
+                  f"{payload.get('direct_vs_sdf_voxel_difference')}\n",
+                  f"- direct vs full-path changed voxels: "
+                  f"{payload.get('direct_vs_full_path_voxel_difference')}\n",
+                  f"- finalized: `{finalized}`\n\n",
+                  "| path | Dice | clDice | HD95 (mm) | score |\n",
+                  "|---|---:|---:|---:|---:|\n"]
+        for path in ("direct", "sdf_decode", "full_path"):
+            values = payload.get("overall", {}).get("per_side", {}).get(path, {})
+            def fmt(name):
+                value = values.get(name)
+                return "NA" if value is None else f"{value:.6f}"
+            report.append(f"| {path} | {fmt('dice')} | {fmt('cldice')} | "
+                          f"{fmt('hd95')} | {fmt('score')} |\n")
+        report.append("\nThe non-inferiority margin remains null pending an explicit user decision.\n")
+        self._atomic_text(self.baseline_dir / "identity_prior_report.md", "".join(report))
+
+    def identity_480(self):
+        audit = self._validate_final_audit()
+        inputs = {"inventory_sha256": sha256_file(self.inventory_path),
+                  "provenance_sha256": sha256_file(self.provenance_path),
+                  "audit_sha256": sha256_file(self.audit_480_path)}
+        final_json = self.baseline_dir / "identity_prior.json"
+        if self._receipt_valid(self.identity_480_receipt_path, inputs):
+            return self._load_stage_json(final_json, "identity prior")
+        view = self.create_hard_view(self.case_ids, "prompt1_hard_view_identity_480")
+        raw_prefix = self.baseline_dir / "identity_prior_work"
+        raw_json = raw_prefix.with_suffix(".json")
+        cmd = [sys.executable, str(ROOT / "scripts/identity_preflight.py"),
+               "--splits", str(self.splits_path), "--images", str(self.images),
+               "--labels", str(self.labels), "--oof-hard", str(view),
+               "--coarse-sdf", str(self.coarse_dir), "--gt-sdf", str(self.gt_sdf_dir),
+               "--provenance-manifest", str(self.provenance_path),
+               "--inventory", str(self.inventory_path),
+               "--expected-cases", str(EXPECTED_CASES), "--device", self.device,
+               "--out-prefix", str(raw_prefix),
+               "--state", str(self.prompt_dir / "identity_480_state.json"),
+               "--resume", "--replace-reports"]
+        subprocess.run(cmd, cwd=ROOT, check=True)
+        raw = self._load_stage_json(raw_json, "identity work report")
+        if raw.get("summary", {}).get("decision") != "PASS":
+            raise RuntimeError(f"identity-480 failed: {raw.get('summary', {}).get('decision')}")
+        audit_summary = audit["summary"]
+        status_counts = audit_summary["status_counts"]
+        manifest = {"summary": {
+            "valid_cases": status_counts.get("valid", 0),
+            "missing_cases": status_counts.get("missing", 0),
+            "invalid_cases": status_counts.get("invalid", 0),
+            "fold_provenance_errors": audit_summary.get("provenance_errors", 0),
+            "true_softmax_valid_cases": 0}}
+        payload, case_rows, folds = self._identity_payload(raw, manifest)
+        payload["identity_complete"] = bool(
+            len(raw.get("cases", [])) == EXPECTED_CASES
+            and raw["summary"].get("decision") == "PASS")
+        payload["complete_cv"] = False
+        payload["provenance_source"] = "legacy_import"
+        payload["true_softmax_required"] = False
+        payload["cross_runtime_validation"] = self._provenance().get(
+            "cross_runtime_validation")
+        atomic_json(final_json, payload)
+        self._write_csv(self.baseline_dir / "identity_prior_cases.csv", case_rows)
+        self._write_csv(self.baseline_dir / "identity_prior_folds.csv", folds)
+        self._write_identity_report(payload, finalized=False)
+        raw_csv = raw_prefix.parent / f"{raw_prefix.name}_cases.csv"
+        self._write_stage_receipt(
+            self.identity_480_receipt_path, "identity-480", inputs,
+            {"raw_identity_json": raw_json, "raw_identity_csv": raw_csv,
+             "raw_identity_report": raw_prefix.with_suffix(".md"),
+             "identity_state": self.prompt_dir / "identity_480_state.json"},
+            {"decision": raw["summary"]["decision"],
+             "evaluated_cases": len(raw.get("cases", []))})
+        self.state.data["current_stage"] = "identity_480_complete"
+        self.state.data["complete_cv"] = False
+        self.state.save()
+        return payload
+
+    def finalize_prompt1(self):
+        current_inventory_sha = sha256_file(self.inventory_path)
+        current_provenance_sha = sha256_file(self.provenance_path)
+        current_audit_sha = sha256_file(self.audit_480_path)
+        upstream = {
+            "inventory_receipt": self.inventory_receipt_path,
+            "legacy_import_receipt": self.legacy_import_receipt_path,
+            "audit_receipt": self.audit_480_receipt_path,
+            "sdf_receipt": self.sdf_receipt_path,
+            "identity_receipt": self.identity_480_receipt_path,
+        }
+        expected_inputs = {
+            "inventory_receipt": {"splits_sha256": sha256_file(self.splits_path)},
+            "audit_receipt": {"inventory_sha256": current_inventory_sha,
+                              "provenance_sha256": current_provenance_sha,
+                              "splits_sha256": sha256_file(self.splits_path)},
+            "sdf_receipt": {"final_inventory_sha256": current_inventory_sha},
+            "identity_receipt": {"inventory_sha256": current_inventory_sha,
+                                 "provenance_sha256": current_provenance_sha,
+                                 "audit_sha256": current_audit_sha},
+        }
+        invalid_receipts = [
+            name for name, path in upstream.items()
+            if not self._receipt_valid(path, expected_inputs.get(name))]
+        if invalid_receipts:
+            raise RuntimeError(f"finalize-prompt1 invalid receipts: {invalid_receipts}")
+        inputs = {name: sha256_file(path) for name, path in upstream.items()}
+        if self._receipt_valid(self.final_receipt_path, inputs):
+            return self._load_stage_json(
+                self.baseline_dir / "identity_prior.json", "final identity prior")
+        inventory = self._load_stage_json(self.inventory_path, "cache inventory")
+        inventory_counts = inventory.get("summary", {}).get("status_counts", {})
+        if (inventory.get("summary", {}).get("total_cases") != EXPECTED_CASES
+                or inventory_counts.get("valid") != EXPECTED_CASES
+                or inventory_counts.get("missing", 0) != 0
+                or inventory_counts.get("invalid", 0) != 0):
+            raise RuntimeError(f"final inventory is not {EXPECTED_CASES} valid cases")
+        provenance = self._load_stage_json(self.provenance_path, "legacy provenance import")
+        if provenance.get("summary", {}).get("imported_cases") != EXPECTED_CASES:
+            raise RuntimeError(f"legacy provenance import is not {EXPECTED_CASES} cases")
+        self._validate_final_audit()
+        identity_path = self.baseline_dir / "identity_prior.json"
+        payload = self._load_stage_json(identity_path, "identity prior")
+        if (not payload.get("identity_complete")
+                or payload.get("evaluated_cases") != EXPECTED_CASES
+                or payload.get("direct_vs_sdf_voxel_difference") != 0
+                or payload.get("direct_vs_full_path_voxel_difference") != 0):
+            raise RuntimeError("identity prior is not a passing 480-case three-path result")
+        payload["complete_cv"] = True
+        payload["finalized_at"] = utcnow()
+        payload["finalization_receipts"] = inputs
+        atomic_json(identity_path, payload)
+        self._write_identity_report(payload, finalized=True)
+        subprocess.run([sys.executable, str(ROOT / "scripts/identity_baseline.py"),
+                        "--write-config", "--write-config-from-report", str(identity_path),
+                        "--config", str(ROOT / "configs/flow.yaml")], cwd=ROOT, check=True)
+        config_text = (ROOT / "configs/flow.yaml").read_text()
+        if "noninferiority_margin: null" not in config_text:
+            raise RuntimeError("noninferiority_margin must remain null during Prompt-1 finalization")
+        frozen_config = self.prompt_dir / "flow_with_identity_prior.yaml"
+        atomic_copy(ROOT / "configs/flow.yaml", frozen_config, replace_invalid=True)
+        self.state.data["complete_cv"] = True
+        self.state.data["current_stage"] = "complete"
+        self.state.data.setdefault("timestamps", {})["completed_at"] = utcnow()
+        self.state.save()
+        self._write_stage_receipt(
+            self.final_receipt_path, "finalize-prompt1", inputs,
+            {"identity_prior": identity_path,
+             "identity_report": self.baseline_dir / "identity_prior_report.md",
+             "flow_config": frozen_config},
+            {"complete_cv": True, "evaluated_cases": EXPECTED_CASES,
+             "noninferiority_margin": None})
+        print("[finalize-prompt1] complete_cv=true; noninferiority_margin=null", flush=True)
+        return payload
+
     def run_identity(self, manifest):
         gate = manifest["summary"]
         required = {"valid_cases": EXPECTED_CASES, "missing_cases": 0,
@@ -1199,22 +1885,15 @@ class Prompt1Runner:
         print("[prompt1] two-case smoke/resume validation: PASS", flush=True)
 
     def run_full(self):
-        self.preflight_full()
-        self.build_manifest()
-        self.run_oof_full()
-        self.run_sdf(self.case_ids)
-        manifest = self.build_manifest()
-        self.reconcile_state()
-        failed = self.state.data.get("failed_cases", {})
-        full_stages = {"oof", "sdf", "full_provenance_bootstrap"}
-        unresolved = {stage: values for stage, values in failed.items()
-                      if stage in full_stages and values}
-        if unresolved:
-            self.state.data["complete_cv"] = False
-            self.state.save()
-            raise RuntimeError(f"unresolved failed cases remain: {unresolved}")
-        self.run_identity(manifest)
-        print("[prompt1] complete-CV identity outputs written; Prompt-1 evidence is ready", flush=True)
+        self.build_inventory()
+        self.import_legacy_provenance()
+        self.audit_480()
+        self.complete_missing_sdf()
+        self.build_inventory()
+        self.audit_480()
+        self.identity_480()
+        self.finalize_prompt1()
+        print("[prompt1] resumable 480-case Prompt-1 workflow complete", flush=True)
 
     def run(self):
         """Backward-compatible programmatic alias for the complete workflow."""
@@ -1225,11 +1904,34 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="JSON written by the Colab config cell")
     parser.add_argument("action", choices=(
+        "build-inventory", "import-legacy-provenance", "audit-480",
+        "complete-missing-sdf", "identity-480", "finalize-prompt1",
+        "complete-true-softmax",
         "preflight-quick", "smoke", "preflight-full", "run-full", "manifest",
         "preflight", "run"))
     args = parser.parse_args()
     runner = Prompt1Runner(json.loads(Path(args.config).read_text()))
-    if args.action == "preflight-quick":
+    if args.action == "build-inventory":
+        result = runner.build_inventory()
+        print(json.dumps(result["summary"], indent=2))
+    elif args.action == "import-legacy-provenance":
+        result = runner.import_legacy_provenance()
+        print(json.dumps(result["summary"], indent=2))
+    elif args.action == "audit-480":
+        result = runner.audit_480()
+        print(json.dumps(result["summary"], indent=2))
+    elif args.action == "complete-missing-sdf":
+        print(json.dumps(runner.complete_missing_sdf(), indent=2))
+    elif args.action == "identity-480":
+        result = runner.identity_480()
+        print(json.dumps({"identity_complete": result.get("identity_complete"),
+                          "complete_cv": result.get("complete_cv")}, indent=2))
+    elif args.action == "finalize-prompt1":
+        result = runner.finalize_prompt1()
+        print(json.dumps({"complete_cv": result.get("complete_cv")}, indent=2))
+    elif args.action == "complete-true-softmax":
+        runner.complete_true_softmax_by_fold()
+    elif args.action == "preflight-quick":
         runner.preflight_quick()
     elif args.action == "smoke":
         runner.smoke()

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -6,8 +7,10 @@ import pytest
 
 import _pathsetup  # noqa: F401
 from scripts.prompt1_completion import (CompletionState, NonRetryableCaseError,
+                                         CROSS_RUNTIME_CHANGED_VOXELS,
                                          assert_voxelwise_match, atomic_copy,
-                                         load_splits_config, run_case_queue)
+                                         inventory_file_record, load_splits_config,
+                                         run_case_queue)
 
 
 def test_atomic_publish_refuses_existing_valid_artifact(tmp_path):
@@ -246,3 +249,70 @@ def test_full_preflight_keeps_configured_40_case_gate(tmp_path):
     runner.legacy_complete_cache_ids = lambda: [f"case_{index:02d}" for index in range(39)]
     with pytest.raises(RuntimeError, match="at least 40"):
         runner.select_full_preflight_cases()
+
+
+def test_inventory_reuses_unchanged_file_metadata_without_reopening(tmp_path):
+    path = tmp_path / "case.npz"
+    np.savez_compressed(path, sdf=np.zeros((2, 2, 3, 4), np.float16),
+                        spacing=np.ones(3, np.float32))
+    first = inventory_file_record(path, "gt_sdf")
+    reused = inventory_file_record(
+        path, "gt_sdf", first,
+        metadata_reader=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("unchanged NPZ was reopened")))
+    assert reused == first
+    assert reused["sha256"] and reused["shape"] == [2, 2, 3, 4]
+
+
+def test_legacy_import_records_cross_runtime_near_exact_diagnostic():
+    assert CROSS_RUNTIME_CHANGED_VOXELS == {0: 3, 1: 1, 2: 6, 3: 2, 4: 2}
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    entry = runner._legacy_import_entry(
+        "case_a", 2, "/cache/oof_probs/case_a.npz", "hard-sha",
+        "/results/fold_2/checkpoint_final.pth", "checkpoint-sha")
+    assert entry["provenance_source"] == "legacy_import"
+    assert entry["artifact_type"] == "derived_one_hot"
+    assert entry["expected_fold"] == 2
+    assert entry["exact_reproduction_claim"] is False
+    assert entry["cross_runtime_validation"]["changed_voxels"] == 6
+
+
+def test_run_full_is_thin_resumable_stage_wrapper():
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    calls = []
+    runner.build_inventory = lambda: calls.append("inventory")
+    runner.import_legacy_provenance = lambda: calls.append("import")
+    runner.audit_480 = lambda: calls.append("audit")
+    runner.complete_missing_sdf = lambda: calls.append("sdf")
+    runner.identity_480 = lambda: calls.append("identity")
+    runner.finalize_prompt1 = lambda: calls.append("finalize")
+    runner.preflight_full = lambda: (_ for _ in ()).throw(AssertionError("legacy preflight"))
+    runner.build_manifest = lambda: (_ for _ in ()).throw(AssertionError("legacy manifest"))
+    runner.run_full()
+    assert calls == ["inventory", "import", "audit", "sdf", "inventory",
+                     "audit", "identity", "finalize"]
+
+
+def test_finalize_fails_closed_before_480_cases():
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    runner._load_stage_json = lambda _path, _name: {
+        "summary": {"total_cases": 479, "status_counts": {"valid": 479}}}
+    runner.audit_480_path = Path("audit.json")
+    with pytest.raises(RuntimeError, match="480"):
+        runner._validate_final_audit()
+
+
+def test_true_softmax_completion_batches_once_per_missing_fold(tmp_path):
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    runner.splits = {"folds": [
+        {"val": ["a", "b"]}, {"val": ["c"]}, {"val": ["d"]},
+        {"val": ["e"]}, {"val": ["f"]}]}
+    runner.softmax_valid = lambda case_id: case_id in {"b", "d", "e", "f"}
+    calls = []
+    runner._predict_softmax_fold = lambda fold, ids: calls.append((fold, ids))
+    runner.complete_true_softmax_by_fold()
+    assert calls == [(0, ["a"]), (1, ["c"])]

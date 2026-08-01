@@ -12,16 +12,18 @@ def test_prompt1_colab_notebook_has_required_contract():
         "OUTPUT_ROOT", "REPO_URL", "PINNED_COMMIT", "NUM_WORKERS", "DEVICE",
         "MAX_CASES", "FORCE_REBUILD", "EXPORT_TRUE_SOFTMAX", "RETRY_FAILED",
         "SPLITS_PATH", "configs_cache/splits.json", "QUICK_PREFLIGHT_CASES_PER_FOLD",
-        "FULL_PREFLIGHT_CASES", "cache_manifest_480", "identity_prior", "pytest",
-        "preflight-quick", "smoke", "preflight-full", "run-full",
+        "FULL_PREFLIGHT_CASES", "cache_inventory_480", "identity_prior", "pytest",
+        "build-inventory", "import-legacy-provenance", "audit-480",
+        "complete-missing-sdf", "identity-480", "finalize-prompt1", "run-full",
     )
     for token in required:
         assert token in combined
     assert "/Users/anil" not in combined
     assert notebook["metadata"]["accelerator"] == "GPU"
     groups = {cell.get("metadata", {}).get("prompt1_group") for cell in notebook["cells"]}
-    assert {"SETUP_TESTS", "QUICK_PREFLIGHT", "TWO_CASE_SMOKE",
-            "FULL_PREFLIGHT", "FULL_COMPLETION"} <= groups
+    assert {"SETUP_TESTS", "BUILD_INVENTORY", "IMPORT_LEGACY_PROVENANCE",
+            "AUDIT_480", "COMPLETE_MISSING_SDF", "IDENTITY_480",
+            "FINALIZE_PROMPT1", "FULL_COMPLETION"} <= groups
 
 
 def test_first_code_cell_is_the_single_editable_configuration():
@@ -35,5 +37,6 @@ def test_first_code_cell_is_the_single_editable_configuration():
     assert "SPLITS_PATH = DRIVE_ROOT / 'configs_cache/splits.json'" in source
     assert "QUICK_PREFLIGHT_CASES_PER_FOLD = 1" in source
     assert "FULL_PREFLIGHT_CASES = 40" in source
-    assert "EXPORT_TRUE_SOFTMAX = True" in source
+    assert "EXPORT_TRUE_SOFTMAX = False" in source
+    assert "SDF_BATCH_SIZE = 12" in source
     assert "FORCE_REBUILD = False" in source
