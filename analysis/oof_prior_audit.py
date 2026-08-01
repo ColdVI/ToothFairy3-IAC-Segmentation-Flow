@@ -355,6 +355,8 @@ def main():
     parser.add_argument("--max-cases", type=int, default=None)
     parser.add_argument("--case-ids", default=None,
                         help="optional JSON list selecting an explicit audited cohort")
+    parser.add_argument("--heartbeat-every", type=int, default=10)
+    parser.add_argument("--progress-prefix", default=None)
     args = parser.parse_args()
 
     with open(args.splits) as handle:
@@ -381,6 +383,9 @@ def main():
     hard_dir = args.oof_hard or args.legacy_oof
     for index, case_id in enumerate(case_ids, start=1):
         if args.resume and case_id in state["cases"]:
+            if (index % args.heartbeat_every == 0 or index == len(case_ids)):
+                prefix = args.progress_prefix or "[oof-audit]"
+                print(f"{prefix} {index}/{len(case_ids)}", flush=True)
             continue
         try:
             row = audit_case(case_id, fold_map[case_id], args.images, args.labels,
@@ -391,8 +396,9 @@ def main():
                    "status": "invalid", "error": f"{type(error).__name__}: {error}"}
         state["cases"][case_id] = row
         atomic_json(state_path, state)
-        if index % 10 == 0 or index == len(case_ids):
-            print(f"[oof-audit] {index}/{len(case_ids)}", flush=True)
+        if index % args.heartbeat_every == 0 or index == len(case_ids):
+            prefix = args.progress_prefix or "[oof-audit]"
+            print(f"{prefix} {index}/{len(case_ids)}", flush=True)
     cases = [state["cases"][case_id] for case_id in case_ids]
     summary = write_reports(prefix, cases, legacy_adapter=bool(args.legacy_oof))
     print(json.dumps(summary, indent=2))

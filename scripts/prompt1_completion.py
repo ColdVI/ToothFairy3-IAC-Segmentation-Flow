@@ -22,6 +22,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import nibabel as nib
 import numpy as np
@@ -48,6 +49,20 @@ HEARTBEAT_EVERY = 10
 
 class NonRetryableCaseError(RuntimeError):
     """A deterministic case failure for which another identical run is wasteful."""
+
+
+def load_splits_config(config, repo_root=ROOT):
+    """Load the configured fold split, retaining the repository fallback."""
+    configured = config.get("SPLITS_PATH")
+    path = Path(configured) if configured else Path(repo_root) / "configs" / "splits.json"
+    if not path.is_file():
+        source = "configured SPLITS_PATH" if configured else "repository splits fallback"
+        raise FileNotFoundError(f"{source} does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid splits JSON at {path}: {error}") from error
+    return path, payload
 
 
 def utcnow():
@@ -182,7 +197,7 @@ class CompletionState:
 
 def run_case_queue(stage, cases, state, worker, validator, fold_map=None,
                    retry_failed=True, heartbeat_every=HEARTBEAT_EVERY,
-                   skip_initially_valid=True):
+                   skip_initially_valid=True, progress_prefix=None):
     """Run a case queue; a failed case never prevents later cases from running."""
     cases = list(cases)
     completed = 0
@@ -192,6 +207,8 @@ def run_case_queue(stage, cases, state, worker, validator, fold_map=None,
             completed += 1
             if completed % heartbeat_every == 0 or completed == len(cases):
                 state.heartbeat(completed, len(cases))
+            if progress_prefix:
+                print(f"{progress_prefix} {completed}/{len(cases)}", flush=True)
             continue
         while True:
             state.begin(stage, case_id, (fold_map or {}).get(case_id))
@@ -201,6 +218,8 @@ def run_case_queue(stage, cases, state, worker, validator, fold_map=None,
                     raise ValueError(f"worker returned but {stage} artifact is invalid")
                 state.complete(stage, case_id, result)
                 completed += 1
+                if progress_prefix:
+                    print(f"{progress_prefix} {completed}/{len(cases)}", flush=True)
                 break
             except KeyboardInterrupt:
                 state.save()
@@ -263,8 +282,7 @@ class Prompt1Runner:
                           self.gt_sdf_dir, self.prompt_dir, self.analysis_dir,
                           self.baseline_dir):
             directory.mkdir(parents=True, exist_ok=True)
-        self.splits_path = ROOT / "configs" / "splits.json"
-        self.splits = json.loads(self.splits_path.read_text())
+        self.splits_path, self.splits = load_splits_config(config)
         self.fold_map = expected_fold_map(self.splits)
         self.case_ids = list(self.splits["development"])
         external = set(self.splits.get("external_test", []))
@@ -284,6 +302,15 @@ class Prompt1Runner:
         self.force = bool(config["FORCE_REBUILD"])
         self.export_softmax = bool(config["EXPORT_TRUE_SOFTMAX"])
         self.retry_failed = bool(config["RETRY_FAILED"])
+        self.quick_cases_per_fold = int(config.get("QUICK_PREFLIGHT_CASES_PER_FOLD", 1))
+        self.full_preflight_cases = int(config.get("FULL_PREFLIGHT_CASES", 40))
+        self.preflight_mode = str(config.get("PREFLIGHT_MODE", "quick")).lower()
+        if self.quick_cases_per_fold < 1:
+            raise ValueError("QUICK_PREFLIGHT_CASES_PER_FOLD must be positive")
+        if self.full_preflight_cases < 1:
+            raise ValueError("FULL_PREFLIGHT_CASES must be positive")
+        if self.preflight_mode not in ("quick", "full"):
+            raise ValueError("PREFLIGHT_MODE must be 'quick' or 'full'")
         self.dataset_id = int(config.get("NNUNET_DATASET_ID", 801))
         self.nn_config = config.get("NNUNET_CONFIG", "3d_fullres")
         self.trainer = config.get("NNUNET_TRAINER", "nnUNetTrainerIAC_NoMirror")
@@ -430,12 +457,12 @@ class Prompt1Runner:
         except Exception:
             return False
 
-    def create_hard_view(self):
-        view = Path("/content/prompt1_hard_view")
+    def create_hard_view(self, case_ids=None, name="prompt1_hard_view"):
+        view = Path("/content") / name
         if not Path("/content").is_dir():
-            view = Path(tempfile.gettempdir()) / "prompt1_hard_view"
+            view = Path(tempfile.gettempdir()) / name
         view.mkdir(parents=True, exist_ok=True)
-        for case_id in self.case_ids:
+        for case_id in self.case_ids if case_ids is None else case_ids:
             source = self.hard_path(case_id)
             if source is None:
                 continue
@@ -462,22 +489,91 @@ class Prompt1Runner:
                 complete.append(case_id)
         return complete
 
-    def bootstrap_legacy_provenance(self, case_ids):
+    def quick_candidate_valid(self, case_id):
+        """Validate one quick candidate without inspecting any other case."""
+        legacy = find_case_artifact(self.legacy_hard_dir, case_id)
+        geometry = self._label_geometry(case_id)
+        if legacy is None or geometry is None:
+            return False
+        try:
+            _, legacy_mask, artifact_type = load_oof(legacy)
+            active = self.hard_path(case_id)
+            if (artifact_type not in ("hard_segmentation", "derived_one_hot")
+                    or tuple(legacy_mask.shape) != geometry["shape"] or active is None):
+                return False
+            _, active_mask, _ = load_oof(active)
+            return (np.array_equal(active_mask, legacy_mask)
+                    and self.coarse_valid(case_id) and self.gt_sdf_valid(case_id))
+        except Exception:
+            return False
+
+    def select_quick_preflight_cases(self):
+        selected = []
+        for fold_index, fold in enumerate(self.splits["folds"]):
+            fold_selected = []
+            for case_id in fold["val"]:
+                if self.quick_candidate_valid(case_id):
+                    fold_selected.append(case_id)
+                    print(f"[quick-preflight] fold={fold_index} case={case_id}", flush=True)
+                    if len(fold_selected) == self.quick_cases_per_fold:
+                        break
+            if len(fold_selected) != self.quick_cases_per_fold:
+                raise RuntimeError(
+                    f"quick preflight fold {fold_index} requires "
+                    f"{self.quick_cases_per_fold} legacy-complete cases; "
+                    f"found {len(fold_selected)}")
+            selected.extend(fold_selected)
+        return selected
+
+    def select_full_preflight_cases(self):
+        candidates = self.legacy_complete_cache_ids()
+        if len(candidates) < self.full_preflight_cases:
+            raise RuntimeError(
+                f"full preflight requires at least {self.full_preflight_cases} complete "
+                f"legacy oof_probs cases; found {len(candidates)}")
+        return candidates[:self.full_preflight_cases]
+
+    def quick_preflight_paths(self):
+        count = len(self.splits["folds"]) * self.quick_cases_per_fold
+        return SimpleNamespace(
+            ids=self.prompt_dir / f"quick_preflight_{count}_case_ids.json",
+            receipt=self.prompt_dir / f"quick_preflight_{count}_receipt.json",
+            provenance_receipt=self.prompt_dir / "quick_provenance_bootstrap_receipt.json",
+            audit_prefix=self.analysis_dir / f"oof_prior_audit_quick{count}",
+            identity_prefix=self.baseline_dir / f"identity_quick{count}",
+            state=self.prompt_dir / "quick_preflight_state.json")
+
+    def full_preflight_paths(self):
+        count = self.full_preflight_cases
+        return SimpleNamespace(
+            ids=self.prompt_dir / f"full_preflight_{count}_case_ids.json",
+            receipt=self.prompt_dir / f"full_preflight_{count}_receipt.json",
+            provenance_receipt=self.prompt_dir / "full_provenance_bootstrap_receipt.json",
+            audit_prefix=self.analysis_dir / f"oof_prior_audit_full{count}",
+            identity_prefix=self.baseline_dir / f"identity_full_preflight_{count}",
+            state=self.prompt_dir / "full_preflight_state.json")
+
+    def bootstrap_legacy_provenance(self, case_ids, mode="full", receipt_path=None):
         case_ids = list(case_ids)
-        receipt_path = self.prompt_dir / "legacy_oof_provenance_bootstrap_receipt.json"
+        if receipt_path is None:
+            receipt_path = (self.quick_preflight_paths().provenance_receipt
+                            if mode == "quick" else self.full_preflight_paths().provenance_receipt)
         if receipt_path.is_file():
             receipt = json.loads(receipt_path.read_text())
             if receipt.get("pinned_git_sha") != self.git_sha:
                 raise RuntimeError("legacy bootstrap receipt belongs to another git SHA")
             if receipt.get("case_ids") != case_ids:
                 raise RuntimeError("legacy bootstrap cohort changed after it was sealed")
+        stage = f"{mode}_provenance_bootstrap"
         completed = run_case_queue(
-            "provenance_bootstrap", case_ids, self.state,
+            stage, case_ids, self.state,
             lambda case_id: self._predict_case(
                 case_id, compare_existing=True,
                 verification="legacy_reprediction_voxelwise", force_softmax=True),
-            self.bootstrap_provenance_valid, self.fold_map, self.retry_failed)
-        failures = self.state.data.get("failed_cases", {}).get("provenance_bootstrap", {})
+            self.bootstrap_provenance_valid, self.fold_map, self.retry_failed,
+            heartbeat_every=1 if mode == "quick" else HEARTBEAT_EVERY,
+            progress_prefix="[quick-preflight] provenance" if mode == "quick" else None)
+        failures = self.state.data.get("failed_cases", {}).get(stage, {})
         if completed != len(case_ids) or failures:
             self.state.data["complete_cv"] = False
             self.state.save()
@@ -496,81 +592,120 @@ class Prompt1Runner:
         atomic_json(receipt_path, {
             "pinned_git_sha": self.git_sha, "completed_at": utcnow(),
             "case_ids": case_ids, "records": records})
-        print(f"[provenance-bootstrap] {len(case_ids)} legacy cases verified", flush=True)
+        print(f"[{mode}-provenance-bootstrap] {len(case_ids)} legacy cases verified", flush=True)
 
-    def preflight(self):
-        receipt_path = self.prompt_dir / "identity_preflight_40_receipt.json"
-        ids_path = self.prompt_dir / "identity_preflight_40_case_ids.json"
-        audit_prefix = self.analysis_dir / "oof_prior_audit"
-        identity_prefix = self.baseline_dir / "identity_preflight_40"
-        audit_json = audit_prefix.with_suffix(".json")
-        identity_json = identity_prefix.with_suffix(".json")
-        receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else None
+    def _load_or_select_preflight_ids(self, paths, mode):
+        receipt = json.loads(paths.receipt.read_text()) if paths.receipt.is_file() else None
         if receipt:
             if receipt.get("pinned_git_sha") != self.git_sha:
                 raise RuntimeError("preflight receipt belongs to a different pinned git SHA")
             ids = receipt.get("case_ids", [])
-        elif ids_path.is_file() and audit_json.is_file() and identity_json.is_file():
-            ids = json.loads(ids_path.read_text())
+        elif paths.ids.is_file():
+            ids = json.loads(paths.ids.read_text())
         else:
-            candidates = self.legacy_complete_cache_ids()
-            if len(candidates) < 40:
-                raise RuntimeError(
-                    "initial preflight requires at least 40 complete legacy oof_probs cases; "
-                    f"found {len(candidates)}")
-            ids = candidates[:40]
-            atomic_json(ids_path, ids)
-        if len(ids) != 40 or len(set(ids)) != 40:
-            raise RuntimeError("preflight cohort receipt is not 40 unique cases")
-        self.bootstrap_legacy_provenance(ids)
-        currently_complete = set(self.complete_cache_ids())
-        incomplete = [case_id for case_id in ids if case_id not in currently_complete]
+            ids = (self.select_quick_preflight_cases() if mode == "quick"
+                   else self.select_full_preflight_cases())
+            atomic_json(paths.ids, ids)
+        expected = (len(self.splits["folds"]) * self.quick_cases_per_fold
+                    if mode == "quick" else self.full_preflight_cases)
+        if len(ids) != expected or len(set(ids)) != expected:
+            raise RuntimeError(f"{mode} preflight cohort is not {expected} unique cases")
+        if not paths.ids.is_file():
+            atomic_json(paths.ids, ids)
+        return ids, receipt
+
+    def _validate_preflight_cohort(self, ids):
+        incomplete = [case_id for case_id in ids if not (
+            self.hard_valid(case_id) and self.coarse_valid(case_id)
+            and self.gt_sdf_valid(case_id))]
         if incomplete:
             raise RuntimeError(f"sealed preflight artifacts became invalid: {incomplete[:5]}")
         bad_provenance = [case_id for case_id in ids if not self.provenance_valid(case_id)]
         if bad_provenance:
             raise RuntimeError("legacy hard OOF provenance is absent or invalid; refusing to infer it "
                                f"from filenames (first: {bad_provenance[:5]})")
-        view = self.create_hard_view()
+
+    def _run_preflight_audit(self, ids, paths, mode):
+        audit_json = paths.audit_prefix.with_suffix(".json")
+        view = self.create_hard_view(ids, f"prompt1_hard_view_{mode}")
         if not audit_json.is_file():
             cmd = [sys.executable, str(ROOT / "analysis/oof_prior_audit.py"),
                    "--splits", str(self.splits_path), "--images", str(self.images),
                    "--labels", str(self.labels), "--oof-hard", str(view),
                    "--oof-softmax", str(self.softmax_dir), "--coarse-sdf", str(self.coarse_dir),
                    "--gt-sdf", str(self.gt_sdf_dir), "--provenance-manifest", str(self.provenance_path),
-                   "--case-ids", str(ids_path), "--out-prefix", str(audit_prefix),
-                   "--state", str(self.prompt_dir / "oof_audit_40_state.json"), "--resume"]
+                   "--case-ids", str(paths.ids), "--out-prefix", str(paths.audit_prefix),
+                   "--state", str(self.prompt_dir / f"{mode}_oof_audit_state.json"), "--resume"]
+            if mode == "quick":
+                cmd += ["--heartbeat-every", "1", "--progress-prefix",
+                        "[quick-preflight] audit"]
             subprocess.run(cmd, cwd=ROOT, check=True)
-        audit = json.loads(audit_json.read_text())["summary"]
-        if audit.get("status_counts") != {"valid": 40}:
-            raise RuntimeError(f"OOF audit failed: {audit.get('status_counts')}")
+        return json.loads(audit_json.read_text())["summary"]
+
+    def _run_preflight_identity(self, ids, paths, mode):
+        identity_json = paths.identity_prefix.with_suffix(".json")
+        view = self.create_hard_view(ids, f"prompt1_hard_view_{mode}")
         if not identity_json.is_file():
             cmd = [sys.executable, str(ROOT / "scripts/identity_preflight.py"),
                    "--splits", str(self.splits_path), "--images", str(self.images),
                    "--labels", str(self.labels), "--oof-hard", str(view),
                    "--coarse-sdf", str(self.coarse_dir), "--gt-sdf", str(self.gt_sdf_dir),
-                   "--provenance-manifest", str(self.provenance_path), "--case-ids", str(ids_path),
-                   "--expected-cases", "40", "--device", self.device,
-                   "--out-prefix", str(identity_prefix),
-                   "--state", str(self.prompt_dir / "identity_preflight_40_state.json"), "--resume"]
+                   "--provenance-manifest", str(self.provenance_path), "--case-ids", str(paths.ids),
+                   "--expected-cases", str(len(ids)), "--device", self.device,
+                   "--out-prefix", str(paths.identity_prefix),
+                   "--state", str(self.prompt_dir / f"{mode}_identity_state.json"), "--resume"]
+            if mode == "quick":
+                cmd += ["--progress-prefix", "[quick-preflight] identity"]
             subprocess.run(cmd, cwd=ROOT, check=True)
-        decision = json.loads(identity_json.read_text())["summary"]["decision"]
-        if decision != "PASS":
-            raise RuntimeError(f"identity preflight failed: {decision}")
-        checksums = {case_id: {
+        return json.loads(identity_json.read_text())["summary"]["decision"]
+
+    def _preflight_checksums(self, ids):
+        return {case_id: {
             "hard": sha256_file(self.hard_path(case_id)),
             "coarse_sdf": sha256_file(self.coarse_dir / f"{case_id}.npz"),
             "gt_sdf": sha256_file(self.gt_sdf_dir / f"{case_id}.npz")}
             for case_id in ids}
+
+    def _preflight(self, mode):
+        paths = self.quick_preflight_paths() if mode == "quick" else self.full_preflight_paths()
+        ids, receipt = self._load_or_select_preflight_ids(paths, mode)
+        atomic_json(paths.state, {"mode": mode, "current_stage": "provenance",
+                                  "case_ids": ids, "updated_at": utcnow()})
+        self.bootstrap_legacy_provenance(ids, mode, paths.provenance_receipt)
+        self._validate_preflight_cohort(ids)
+        atomic_json(paths.state, {"mode": mode, "current_stage": "audit",
+                                  "case_ids": ids, "updated_at": utcnow()})
+        audit = self._run_preflight_audit(ids, paths, mode)
+        if audit.get("status_counts") != {"valid": len(ids)}:
+            raise RuntimeError(f"OOF audit failed: {audit.get('status_counts')}")
+        atomic_json(paths.state, {"mode": mode, "current_stage": "identity",
+                                  "case_ids": ids, "updated_at": utcnow()})
+        decision = self._run_preflight_identity(ids, paths, mode)
+        if decision != "PASS":
+            raise RuntimeError(f"identity preflight failed: {decision}")
+        checksums = self._preflight_checksums(ids)
         if receipt and receipt.get("checksums") != checksums:
-            raise RuntimeError("a sealed 40-case preflight artifact changed after acceptance")
-        atomic_json(receipt_path, {"pinned_git_sha": self.git_sha,
-                                   "passed_at": receipt.get("passed_at") if receipt else utcnow(),
-                                   "case_ids": ids, "checksums": checksums,
-                                   "audit_decision": "PASS", "identity_decision": "PASS"})
-        self.state.data["timestamps"]["preflight_passed_at"] = utcnow()
+            raise RuntimeError(f"a sealed {mode} preflight artifact changed after acceptance")
+        passed_at = receipt.get("passed_at") if receipt else utcnow()
+        atomic_json(paths.receipt, {"pinned_git_sha": self.git_sha, "mode": mode,
+                                    "passed_at": passed_at, "case_ids": ids,
+                                    "checksums": checksums, "audit_decision": "PASS",
+                                    "identity_decision": "PASS"})
+        atomic_json(paths.state, {"mode": mode, "current_stage": "complete",
+                                  "case_ids": ids, "updated_at": utcnow()})
+        self.state.data["timestamps"][f"{mode}_preflight_passed_at"] = utcnow()
         self.state.save()
-        print("[preflight] 40-case OOF audit and three-path identity: PASS", flush=True)
+        print(f"[{mode}-preflight] {len(ids)}-case OOF audit and three-path identity: PASS",
+              flush=True)
+
+    def preflight_quick(self):
+        return self._preflight("quick")
+
+    def preflight_full(self):
+        return self._preflight("full")
+
+    def preflight(self):
+        return self.preflight_quick() if self.preflight_mode == "quick" else self.preflight_full()
 
     def _cached_sha256(self, path):
         path = Path(path)
@@ -701,7 +836,14 @@ class Prompt1Runner:
             if existing is not None and self.hard_valid(case_id):
                 _, old_mask, _ = load_oof(existing)
                 if compare_existing:
-                    assert_voxelwise_match(old_mask, local_mask, case_id)
+                    reference_mask = old_mask
+                    if verification == "legacy_reprediction_voxelwise":
+                        legacy_reference = find_case_artifact(self.legacy_hard_dir, case_id)
+                        if legacy_reference is None:
+                            raise NonRetryableCaseError(
+                                f"legacy artifact is missing for {case_id}")
+                        _, reference_mask, _ = load_oof(legacy_reference)
+                    assert_voxelwise_match(reference_mask, local_mask, case_id)
                 hard_sha = sha256_file(existing)
             else:
                 target = self.hard_dir / f"{case_id}.npz"
@@ -735,9 +877,9 @@ class Prompt1Runner:
                 "legacy_hard_sha256", "reproduced_hard_sha256", "verified_at")
             if verification == "legacy_reprediction_voxelwise":
                 legacy = find_case_artifact(self.legacy_hard_dir, case_id)
-                if legacy is None or existing.resolve() != legacy.resolve():
+                if legacy is None:
                     raise NonRetryableCaseError(
-                        f"legacy artifact is not the active hard OOF for {case_id}")
+                        f"legacy artifact is missing for {case_id}")
                 entry.update({
                     "verification_method": verification,
                     "legacy_voxelwise_match": True,
@@ -754,24 +896,22 @@ class Prompt1Runner:
             return {"checksums": {"hard": hard_sha, "softmax": soft_sha},
                     "source_checkpoint": checkpoint, "fold": fold}
 
-    def run_oof(self):
-        smoke_ids = self.case_ids[:2]
-        if not self.state.data.get("oof_smoke_passed"):
-            completed = run_case_queue(
-                "oof_smoke", smoke_ids, self.state,
-                lambda case_id: self._predict_case(case_id, compare_existing=True),
-                lambda case_id: self.hard_valid(case_id) and self.provenance_valid(case_id)
-                                and (not self.export_softmax or self.softmax_valid(case_id)),
-                self.fold_map, self.retry_failed, heartbeat_every=2,
-                skip_initially_valid=False)
-            failed = self.state.data.get("failed_cases", {}).get("oof_smoke", {})
-            if completed != 2 or failed:
-                raise RuntimeError(f"2-case GPU smoke failed: {failed}")
-            self.state.data["oof_smoke_passed"] = True
-            self.state.data["timestamps"]["oof_smoke_passed_at"] = utcnow()
-            self.state.save()
-        if self.max_cases is not None:
-            return smoke_ids[:self.max_cases]
+    def run_smoke_oof(self, smoke_ids):
+        smoke_ids = list(smoke_ids)
+        completed = run_case_queue(
+            "oof_smoke", smoke_ids, self.state,
+            lambda case_id: self._predict_case(case_id, compare_existing=True),
+            lambda case_id: self.hard_valid(case_id) and self.provenance_valid(case_id)
+                            and (not self.export_softmax or self.softmax_valid(case_id)),
+            self.fold_map, self.retry_failed, heartbeat_every=1)
+        failed = self.state.data.get("failed_cases", {}).get("oof_smoke", {})
+        if completed != len(smoke_ids) or failed:
+            raise RuntimeError(f"2-case GPU smoke failed: {failed}")
+        self.state.data["oof_smoke_passed"] = True
+        self.state.data["timestamps"]["oof_smoke_passed_at"] = utcnow()
+        self.state.save()
+
+    def run_oof_full(self):
         queue = [case_id for case_id in self.case_ids
                  if not (self.hard_valid(case_id) and self.provenance_valid(case_id)
                          and (not self.export_softmax or self.softmax_valid(case_id)))]
@@ -781,6 +921,10 @@ class Prompt1Runner:
                             and (not self.export_softmax or self.softmax_valid(case_id)),
             self.fold_map, self.retry_failed)
         return self.case_ids
+
+    def run_oof(self):
+        """Compatibility wrapper for callers that previously used the full queue."""
+        return self.run_oof_full()
 
     def _compute_sdf_case(self, case_id):
         local_root = Path("/content/prompt1_work")
@@ -835,6 +979,14 @@ class Prompt1Runner:
             lambda case_id: self.coarse_valid(case_id) and self.gt_sdf_valid(case_id),
             self.fold_map, self.retry_failed)
 
+    def _validate_smoke_cases(self, case_ids):
+        invalid = [case_id for case_id in case_ids if not (
+            self.hard_valid(case_id) and self.provenance_valid(case_id)
+            and (not self.export_softmax or self.softmax_valid(case_id))
+            and self.coarse_valid(case_id) and self.gt_sdf_valid(case_id))]
+        if invalid:
+            raise RuntimeError(f"smoke artifacts failed validation: {invalid}")
+
     def reconcile_state(self):
         validators = {
             "oof_smoke": lambda case_id: self.hard_valid(case_id)
@@ -844,6 +996,8 @@ class Prompt1Runner:
             and self.provenance_valid(case_id)
             and (not self.export_softmax or self.softmax_valid(case_id)),
             "sdf": lambda case_id: self.coarse_valid(case_id) and self.gt_sdf_valid(case_id),
+            "quick_provenance_bootstrap": self.bootstrap_provenance_valid,
+            "full_provenance_bootstrap": self.bootstrap_provenance_valid,
         }
         for stage, failures in list(self.state.data.get("failed_cases", {}).items()):
             validator = validators.get(stage)
@@ -1030,22 +1184,31 @@ class Prompt1Runner:
             writer.writerows(flattened)
         os.replace(partial, path)
 
-    def run(self):
-        self.preflight()
-        self.build_manifest()
-        selected = self.run_oof()
+    def smoke(self):
+        self.preflight_quick()
+        selected = self.case_ids[:2]
+        if len(selected) != 2:
+            raise RuntimeError(f"smoke requires two development cases, found {len(selected)}")
+        self.run_smoke_oof(selected)
         self.run_sdf(selected)
+        self._validate_smoke_cases(selected)
+        self.state.data["current_stage"] = "smoke_complete"
+        self.state.data["complete_cv"] = False
+        self.state.data.setdefault("timestamps", {})["smoke_completed_at"] = utcnow()
+        self.state.save()
+        print("[prompt1] two-case smoke/resume validation: PASS", flush=True)
+
+    def run_full(self):
+        self.preflight_full()
+        self.build_manifest()
+        self.run_oof_full()
+        self.run_sdf(self.case_ids)
         manifest = self.build_manifest()
-        if self.max_cases is not None:
-            self.state.data["current_stage"] = "smoke_complete"
-            self.state.data["complete_cv"] = False
-            self.state.save()
-            print(f"[prompt1] smoke mode complete for {len(selected)} cases; "
-                  "set MAX_CASES=None and RUN/RESUME for full completion", flush=True)
-            return
         self.reconcile_state()
         failed = self.state.data.get("failed_cases", {})
-        unresolved = {stage: values for stage, values in failed.items() if values}
+        full_stages = {"oof", "sdf", "full_provenance_bootstrap"}
+        unresolved = {stage: values for stage, values in failed.items()
+                      if stage in full_stages and values}
         if unresolved:
             self.state.data["complete_cv"] = False
             self.state.save()
@@ -1053,20 +1216,36 @@ class Prompt1Runner:
         self.run_identity(manifest)
         print("[prompt1] complete-CV identity outputs written; Prompt-1 evidence is ready", flush=True)
 
+    def run(self):
+        """Backward-compatible programmatic alias for the complete workflow."""
+        return self.run_full()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="JSON written by the Colab config cell")
-    parser.add_argument("action", choices=("preflight", "manifest", "run"))
+    parser.add_argument("action", choices=(
+        "preflight-quick", "smoke", "preflight-full", "run-full", "manifest",
+        "preflight", "run"))
     args = parser.parse_args()
     runner = Prompt1Runner(json.loads(Path(args.config).read_text()))
-    if args.action == "preflight":
-        runner.preflight()
+    if args.action == "preflight-quick":
+        runner.preflight_quick()
+    elif args.action == "smoke":
+        runner.smoke()
+    elif args.action == "preflight-full":
+        runner.preflight_full()
+    elif args.action == "run-full":
+        runner.run_full()
     elif args.action == "manifest":
         result = runner.build_manifest()
         print(json.dumps(result["summary"], indent=2))
+    elif args.action == "preflight":
+        print("[warning] 'preflight' is deprecated; using 'preflight-full'", file=sys.stderr)
+        runner.preflight_full()
     else:
-        runner.run()
+        print("[warning] 'run' is deprecated; using 'run-full'", file=sys.stderr)
+        runner.run_full()
 
 
 if __name__ == "__main__":

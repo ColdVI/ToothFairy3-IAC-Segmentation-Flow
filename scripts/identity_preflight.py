@@ -280,6 +280,7 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--out-prefix", default="outputs/baselines/identity_preflight_40")
     parser.add_argument("--state", default=None); parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--progress-prefix", default=None)
     args = parser.parse_args()
 
     splits = json.loads(Path(args.splits).read_text())
@@ -302,12 +303,15 @@ def main():
         state = json.loads(state_path.read_text())
     for index, case_id in enumerate(case_ids, start=1):
         if args.resume and case_id in state["cases"]:
+            prefix = args.progress_prefix or "[identity-preflight]"
+            print(f"{prefix} {index}/{len(case_ids)} {case_id}", flush=True)
             continue
         state["cases"][case_id] = evaluate_case_paths(
             case_id, folds[case_id], args.images, args.labels, directories["hard"],
             args.coarse_sdf, args.gt_sdf, provenance, args.patch, args.steps, args.device)
         atomic_json(state_path, state)
-        print(f"[identity-preflight] {index}/{len(case_ids)} {case_id}", flush=True)
+        prefix = args.progress_prefix or "[identity-preflight]"
+        print(f"{prefix} {index}/{len(case_ids)} {case_id}", flush=True)
     cases = [state["cases"][case_id] for case_id in case_ids]
     summary = summarize(cases, args.expected_cases)
     write_reports(prefix, cases, summary)

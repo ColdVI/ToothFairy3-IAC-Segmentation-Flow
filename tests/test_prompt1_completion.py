@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -6,7 +7,7 @@ import pytest
 import _pathsetup  # noqa: F401
 from scripts.prompt1_completion import (CompletionState, NonRetryableCaseError,
                                          assert_voxelwise_match, atomic_copy,
-                                         run_case_queue)
+                                         load_splits_config, run_case_queue)
 
 
 def test_atomic_publish_refuses_existing_valid_artifact(tmp_path):
@@ -98,3 +99,150 @@ def test_legacy_voxel_match_accepts_identical_masks():
     assert assert_voxelwise_match(mask, mask.copy(), "case_a") == 0
     with pytest.raises(NonRetryableCaseError, match="shape mismatch"):
         assert_voxelwise_match(mask, np.zeros((2, 2, 3), np.uint8), "case_a")
+
+
+def _selection_runner(valid_ids):
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    runner.splits = {"folds": [
+        {"val": ["f0_bad", "f0_good", "f0_later"]},
+        {"val": ["f1_good", "f1_later"]},
+        {"val": ["f2_good"]},
+        {"val": ["f3_good"]},
+        {"val": ["f4_good"]},
+    ]}
+    runner.quick_cases_per_fold = 1
+    checked = []
+
+    def candidate(case_id):
+        checked.append(case_id)
+        return case_id in valid_ids
+
+    runner.quick_candidate_valid = candidate
+    return runner, checked
+
+
+def test_quick_selection_is_one_per_fold_deterministic_and_skips_invalid_first():
+    valid = {"f0_good", "f0_later", "f1_good", "f1_later", "f2_good",
+             "f3_good", "f4_good"}
+    runner, checked = _selection_runner(valid)
+    expected = ["f0_good", "f1_good", "f2_good", "f3_good", "f4_good"]
+    assert runner.select_quick_preflight_cases() == expected
+    assert runner.select_quick_preflight_cases() == expected
+    assert checked[:2] == ["f0_bad", "f0_good"]
+    assert "f0_later" not in checked and "f1_later" not in checked
+
+
+def test_quick_preflight_never_uses_global_scan_or_manifest(tmp_path):
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    runner.quick_preflight_paths = lambda: SimpleNamespace(
+        ids=tmp_path / "quick_ids.json", receipt=tmp_path / "quick_receipt.json",
+        provenance_receipt=tmp_path / "quick_provenance.json",
+        audit_prefix=tmp_path / "audit_quick5", identity_prefix=tmp_path / "identity_quick5",
+        state=tmp_path / "quick_state.json")
+    ids = [f"case_{index}" for index in range(5)]
+    runner.splits = {"folds": [{"val": [case_id]} for case_id in ids]}
+    runner.quick_cases_per_fold = 1
+    runner.select_quick_preflight_cases = lambda: ids
+    runner.git_sha = "abc"
+    runner.bootstrap_legacy_provenance = lambda selected, mode, receipt: None
+    runner._validate_preflight_cohort = lambda selected: None
+    runner._run_preflight_audit = lambda selected, paths, mode: {"status_counts": {"valid": 5}}
+    runner._run_preflight_identity = lambda selected, paths, mode: "PASS"
+    runner._preflight_checksums = lambda selected: {case_id: {} for case_id in selected}
+    runner.state = SimpleNamespace(data={"timestamps": {}}, save=lambda: None)
+    runner.complete_cache_ids = lambda: (_ for _ in ()).throw(AssertionError("global scan"))
+    runner.build_manifest = lambda: (_ for _ in ()).throw(AssertionError("manifest"))
+    runner.preflight_quick()
+    assert json.loads((tmp_path / "quick_ids.json").read_text()) == ids
+
+
+def test_smoke_never_calls_manifest_or_full_preflight():
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    calls = []
+    runner.case_ids = ["a", "b", "c"]
+    runner.preflight_quick = lambda: calls.append("quick")
+    runner.preflight_full = lambda: (_ for _ in ()).throw(AssertionError("full preflight"))
+    runner.build_manifest = lambda: (_ for _ in ()).throw(AssertionError("manifest"))
+    runner.run_smoke_oof = lambda ids: calls.append(("oof", ids))
+    runner.run_sdf = lambda ids: calls.append(("sdf", ids))
+    runner._validate_smoke_cases = lambda ids: calls.append(("validate", ids))
+    runner.state = SimpleNamespace(data={}, save=lambda: calls.append("save"))
+    runner.smoke()
+    assert calls[:4] == ["quick", ("oof", ["a", "b"]),
+                         ("sdf", ["a", "b"]), ("validate", ["a", "b"])]
+    assert runner.state.data["current_stage"] == "smoke_complete"
+
+
+def test_second_smoke_oof_and_sdf_run_skips_valid_artifacts(tmp_path):
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    runner.state = CompletionState(tmp_path / "state.json", "abc", "cpu")
+    runner.export_softmax = True
+    runner.fold_map = {"a": 0, "b": 1}
+    runner.retry_failed = True
+    runner.hard_valid = lambda case_id: True
+    runner.provenance_valid = lambda case_id: True
+    runner.softmax_valid = lambda case_id: True
+    runner.coarse_valid = lambda case_id: True
+    runner.gt_sdf_valid = lambda case_id: True
+    runner._predict_case = lambda case_id, compare_existing=False: (
+        _ for _ in ()).throw(AssertionError(f"regenerated OOF {case_id}"))
+    runner._compute_sdf_case = lambda case_id: (
+        _ for _ in ()).throw(AssertionError(f"regenerated SDF {case_id}"))
+    runner.run_smoke_oof(["a", "b"])
+    runner.run_sdf(["a", "b"])
+    assert set(runner.state.data["completed_cases"]["oof_smoke"]) == {"a", "b"}
+
+
+def test_quick_and_full_receipts_are_isolated(tmp_path):
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    runner.prompt_dir = tmp_path / "prompt1"
+    runner.analysis_dir = tmp_path / "analysis"
+    runner.baseline_dir = tmp_path / "baselines"
+    runner.quick_cases_per_fold = 1
+    runner.full_preflight_cases = 40
+    runner.splits = {"folds": [{"val": [str(index)]} for index in range(5)]}
+    quick = runner.quick_preflight_paths()
+    full = runner.full_preflight_paths()
+    assert quick.receipt.name == "quick_preflight_5_receipt.json"
+    assert quick.provenance_receipt.name == "quick_provenance_bootstrap_receipt.json"
+    assert full.receipt.name == "full_preflight_40_receipt.json"
+    assert full.provenance_receipt.name == "full_provenance_bootstrap_receipt.json"
+    assert quick.receipt != full.receipt
+    assert quick.provenance_receipt != full.provenance_receipt
+    quick.receipt.parent.mkdir(parents=True)
+    quick.receipt.write_text(json.dumps({"case_ids": ["quick"]}))
+    assert not full.receipt.exists()
+
+
+def test_splits_path_override_and_repo_fallback(tmp_path):
+    drive_path = tmp_path / "drive" / "configs_cache" / "splits.json"
+    drive_path.parent.mkdir(parents=True)
+    payload = {"development": ["drive"], "folds": [{"val": ["drive"]}]}
+    drive_path.write_text(json.dumps(payload))
+    path, loaded = load_splits_config({"SPLITS_PATH": str(drive_path)}, tmp_path)
+    assert path == drive_path and loaded == payload
+
+    fallback = tmp_path / "configs" / "splits.json"
+    fallback.parent.mkdir()
+    fallback_payload = {"development": ["repo"], "folds": [{"val": ["repo"]}]}
+    fallback.write_text(json.dumps(fallback_payload))
+    path, loaded = load_splits_config({}, tmp_path)
+    assert path == fallback and loaded == fallback_payload
+    with pytest.raises(FileNotFoundError, match="SPLITS_PATH"):
+        load_splits_config({"SPLITS_PATH": str(tmp_path / "missing.json")}, tmp_path)
+
+
+def test_full_preflight_keeps_configured_40_case_gate(tmp_path):
+    runner = object.__new__(__import__(
+        "scripts.prompt1_completion", fromlist=["Prompt1Runner"]).Prompt1Runner)
+    runner.full_preflight_cases = 40
+    runner.legacy_complete_cache_ids = lambda: [f"case_{index:02d}" for index in range(40)]
+    assert len(runner.select_full_preflight_cases()) == 40
+    runner.legacy_complete_cache_ids = lambda: [f"case_{index:02d}" for index in range(39)]
+    with pytest.raises(RuntimeError, match="at least 40"):
+        runner.select_full_preflight_cases()
