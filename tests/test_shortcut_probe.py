@@ -1,4 +1,5 @@
 import json
+import csv
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from analysis.shortcut_probe import (
     publish_artifacts,
     relative_delta,
     validate_checkpoint_epoch,
+    validate_checkpoint_label,
 )
 
 
@@ -98,6 +100,20 @@ def test_checkpoint_epoch_validation_rejects_wrong_or_missing_epoch(tmp_path):
         validate_checkpoint_epoch(missing, 0)
 
 
+def test_limited_endpoint_checkpoint_labels_preserve_unknown_best_epoch(tmp_path):
+    best = tmp_path / "best.pt"; torch.save({"val": {}}, best)
+    assert validate_checkpoint_label(best, "best_legacy_unknown_epoch")["val"] == {}
+    last = tmp_path / "last.pt"; torch.save({"epoch": 129}, last)
+    assert validate_checkpoint_label(last, "epoch_129")["epoch"] == 129
+    missing_epoch_last = tmp_path / "latest.pt"; torch.save({"val": {}}, missing_epoch_last)
+    with pytest.raises(ReadinessError, match="expected 129"):
+        validate_checkpoint_label(missing_epoch_last, "epoch_129")
+    mislabeled_best = tmp_path / "other" / "best.pt"; mislabeled_best.parent.mkdir()
+    torch.save({"epoch": 0}, mislabeled_best)
+    with pytest.raises(ReadinessError, match="unexpectedly has internal epoch 0"):
+        validate_checkpoint_label(mislabeled_best, "best_legacy_unknown_epoch")
+
+
 def test_existing_analysis_artifacts_are_never_overwritten(tmp_path):
     staged = tmp_path / "staged"; generate_smoke_artifacts(staged)
     output = tmp_path / "output"; publish_artifacts(staged, output)
@@ -109,10 +125,23 @@ def test_existing_analysis_artifacts_are_never_overwritten(tmp_path):
 
 def test_figure_and_summary_smoke_generation(tmp_path):
     generate_smoke_artifacts(tmp_path)
-    figure = tmp_path / "fig1_shortcut.pdf"
+    figure = tmp_path / "limited_endpoint_diagnostic.pdf"
     summary = json.loads((tmp_path / "shortcut_probe_summary.json").read_text())
+    manifest = json.loads((tmp_path / "shortcut_probe_manifest.json").read_text())
     assert figure.stat().st_size > 100
     assert figure.read_bytes().startswith(b"%PDF")
     assert summary["synthetic_smoke_test"] is True
-    assert (tmp_path / "shortcut_probe.csv").stat().st_size > 100
-    assert (tmp_path / "thickening_probe.csv").stat().st_size > 10
+    for payload in (summary, manifest):
+        assert payload["protocol_deviation"] is True
+        assert payload["exact_epoch_trajectory_available"] is False
+        assert payload["historical_per_epoch_checkpoints_were_not_saved"] is True
+        assert payload["diagnostic_only"] is True
+    probe_rows = list(csv.DictReader((tmp_path / "shortcut_probe.csv").open()))
+    assert {row["checkpoint_label"] for row in probe_rows} == {
+        "best_legacy_unknown_epoch", "epoch_129"}
+    assert {row["checkpoint_epoch"] for row in probe_rows
+            if row["checkpoint_label"] == "best_legacy_unknown_epoch"} == {""}
+    thickening_rows = list(csv.DictReader(
+        (tmp_path / "thickening_probe.csv").open()))
+    assert {row["checkpoint_label"] for row in thickening_rows} == {
+        "best_legacy_unknown_epoch", "epoch_129"}

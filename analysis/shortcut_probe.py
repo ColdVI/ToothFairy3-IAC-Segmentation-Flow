@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Deterministic, fail-closed probes for learned algebraic shortcut use.
+"""Deterministic, fail-closed limited endpoint shortcut diagnostics.
 
-The module never trains, migrates, or rewrites a checkpoint.  It first proves
-that exact epoch 0/25/125 snapshots and a complete Prompt-1 identity report are
-available.  Probe outputs are staged locally, validated, and only then
-published with no-overwrite atomic copies.
+Historical per-epoch checkpoints were not saved.  This diagnostic compares the
+two immutable endpoints that actually exist: ``best.pt`` under the explicit
+label ``best_legacy_unknown_epoch`` and ``last.pt`` after verifying its internal
+epoch is 129.  It never trains, migrates, derives, or rewrites a checkpoint.
+Outputs are staged locally, validated, and only then published with
+no-overwrite atomic copies.
 """
 
 from __future__ import annotations
@@ -43,18 +45,24 @@ from flow.model import COND_CH, FLOW_STATE_CH, ResidualVelocityUNet3D  # noqa: E
 from flow.sliding_window import predict_volume  # noqa: E402
 
 
-CHECKPOINT_EPOCHS = (0, 25, 125)
+CHECKPOINT_LABELS = ("best_legacy_unknown_epoch", "epoch_129")
 T_GRID = (0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50,
           0.60, 0.70, 0.80, 0.90, 0.95)
 SEEDS = {"global": 20260802, "patch": 1701, "noise": 2903, "bootstrap": 4409}
 OUTPUT_NAMES = (
     "shortcut_probe.csv",
     "shortcut_probe_summary.json",
-    "fig1_shortcut.pdf",
+    "limited_endpoint_diagnostic.pdf",
     "thickening_probe.csv",
     "shortcut_probe_manifest.json",
 )
-CLAIM = "The observations provide strong empirical evidence consistent with shortcut use."
+PROTOCOL_FLAGS = {
+    "protocol_deviation": True,
+    "exact_epoch_trajectory_available": False,
+    "historical_per_epoch_checkpoints_were_not_saved": True,
+}
+CLAIM = ("Diagnostic-only endpoint observations; no training trajectory or paper-proof "
+         "claim is supported by this limited protocol.")
 
 
 class ReadinessError(RuntimeError):
@@ -240,6 +248,31 @@ def validate_checkpoint_epoch(path, expected_epoch):
     return checkpoint
 
 
+def validate_checkpoint_label(path, checkpoint_label):
+    """Validate the two historical endpoint identities without inventing epochs."""
+    path = Path(path)
+    expected_names = {
+        "best_legacy_unknown_epoch": {"best.pt"},
+        "epoch_129": {"last.pt", "latest.pt"},
+    }
+    if checkpoint_label not in expected_names:
+        raise ReadinessError(f"unsupported limited-endpoint checkpoint label: {checkpoint_label}")
+    if path.name not in expected_names[checkpoint_label]:
+        raise ReadinessError(
+            f"{checkpoint_label} must reference {sorted(expected_names[checkpoint_label])}, got {path.name}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    actual = _checkpoint_epoch(checkpoint)
+    if checkpoint_label == "best_legacy_unknown_epoch":
+        if actual is not None:
+            raise ReadinessError(
+                f"legacy best checkpoint unexpectedly has internal epoch {actual}: {path}")
+    elif checkpoint_label == "epoch_129":
+        if actual != 129:
+            raise ReadinessError(
+                f"checkpoint epoch mismatch: expected 129, got {actual}: {path}")
+    return checkpoint
+
+
 def _resolved_model_contract(checkpoint):
     state = checkpoint.get("model")
     if not isinstance(state, dict) or "stem.weight" not in state or "head.2.weight" not in state:
@@ -262,15 +295,16 @@ def _resolved_model_contract(checkpoint):
     return model, contract
 
 
-def audit_checkpoint(path, expected_epoch):
+def audit_checkpoint(path, checkpoint_label):
     path = Path(path).resolve()
     if not path.is_file():
         raise ReadinessError(f"checkpoint is missing: {path}")
-    checkpoint = validate_checkpoint_epoch(path, expected_epoch)
+    checkpoint = validate_checkpoint_label(path, checkpoint_label)
     model, contract = _resolved_model_contract(checkpoint)
     del model
     return {"path": str(path), "size_bytes": path.stat().st_size,
-            "sha256": sha256_file(path), "epoch": _checkpoint_epoch(checkpoint),
+            "sha256": sha256_file(path), "checkpoint_label": checkpoint_label,
+            "internal_epoch": _checkpoint_epoch(checkpoint),
             "contract": contract}
 
 
@@ -300,7 +334,8 @@ def audit_run_candidates(runs_root):
         return candidates
     for directory in sorted(p for p in root.rglob("*") if p.is_dir() and "flow_fold0" in p.name):
         files = {}
-        for name in ("manifest.json", "config.yaml", "progress.csv", "best.pt", "last.pt"):
+        for name in ("manifest.json", "config.yaml", "progress.csv",
+                     "best.pt", "last.pt", "latest.pt"):
             path = directory / name
             if path.is_file():
                 files[name] = {"path": str(path.resolve()), "size_bytes": path.stat().st_size}
@@ -333,20 +368,21 @@ def readiness_audit(checkpoints, identity_path, *, runs_root=None, selected_run=
     if selected and not selected.is_dir():
         raise ReadinessError(f"selected run directory is missing: {selected}")
     if selected:
-        for epoch, checkpoint in checkpoints.items():
+        for checkpoint_label, checkpoint in checkpoints.items():
             try:
                 Path(checkpoint).resolve().relative_to(selected)
             except ValueError as error:
                 raise ReadinessError(
-                    f"epoch {epoch} checkpoint is outside selected run {selected}: {checkpoint}") from error
-    audited = {str(epoch): audit_checkpoint(checkpoints[epoch], epoch)
-               for epoch in CHECKPOINT_EPOCHS}
+                    f"{checkpoint_label} is outside selected run {selected}: {checkpoint}") from error
+    audited = {label: audit_checkpoint(checkpoints[label], label)
+               for label in CHECKPOINT_LABELS}
     contracts = [item["contract"] for item in audited.values()]
     comparison = [{key: contract[key] for key in ("base", "state_ch", "cond_ch", "patch")}
                   for contract in contracts]
     if any(item != comparison[0] for item in comparison[1:]):
         raise ReadinessError(f"checkpoint model/config contracts differ: {comparison}")
-    return {"status": "ready", "git": state, "checkpoints": audited,
+    return {"status": "ready", **PROTOCOL_FLAGS, "diagnostic_only": True,
+            "git": state, "checkpoints": audited,
             "selected_run": None if selected is None else str(selected),
             "resolved_config": contracts[0]["config"],
             "resolved_config_hash": contracts[0]["config_hash"],
@@ -366,10 +402,12 @@ def _atomic_json_new(path, payload):
     os.replace(partial, path)
 
 
-def _load_patch_shard(path, item, epoch):
+def _load_patch_shard(path, item, checkpoint_label, internal_epoch):
     payload = json.loads(Path(path).read_text())
     expected = len(T_GRID) * 6
-    if (payload.get("epoch") != epoch or payload.get("case_id") != item["case_id"]
+    if (payload.get("checkpoint_label") != checkpoint_label
+            or payload.get("internal_epoch") != internal_epoch
+            or payload.get("case_id") != item["case_id"]
             or payload.get("patch_index") != item["patch_index"]
             or tuple(payload.get("start", ())) != tuple(item["start"])
             or len(payload.get("rows", ())) != expected):
@@ -491,15 +529,16 @@ def _seeded_generator(seed, device):
     return generator
 
 
-def _row_base(epoch, item, t, seed):
+def _row_base(checkpoint_label, internal_epoch, item, t, seed):
     z, y, x = item["start"]
-    return {"aggregation_level": "patch", "checkpoint_epoch": epoch,
+    return {"aggregation_level": "patch", "checkpoint_label": checkpoint_label,
+            "checkpoint_epoch": internal_epoch,
             "case_id": item["case_id"], "fold": 0, "stratum": item["stratum"],
             "patch_index": item["patch_index"], "patch_z": z, "patch_y": y,
             "patch_x": x, "t": t, "seed": seed}
 
 
-def probe_patch(model, epoch, item, case, donor, t, device, batch_size):
+def probe_patch(model, checkpoint_label, internal_epoch, item, case, donor, t, device, batch_size):
     size = int(item["patch_size"]); start = item["start"]
     cond_np = extract_patch(case["cond"], start, size, 0)
     x0_np = extract_patch(case["x0"], start, size, 1)
@@ -532,7 +571,7 @@ def probe_patch(model, epoch, item, case, donor, t, device, batch_size):
     outputs, batch_size = _safe_forward(model, batches, batch_size)
     full = outputs[0]
     similarity = cosine_r2(full, shortcut.cpu())
-    base = _row_base(epoch, item, t, item["seed"])
+    base = _row_base(checkpoint_label, internal_epoch, item, t, item["seed"])
     rows = []
     for index, (name, _, donor_case) in enumerate(interventions):
         delta = relative_delta(full, outputs[index])
@@ -548,7 +587,7 @@ def probe_patch(model, epoch, item, case, donor, t, device, batch_size):
 
 
 def add_case_rows(patch_rows):
-    keys = ("checkpoint_epoch", "case_id", "fold", "stratum", "t", "intervention")
+    keys = ("checkpoint_label", "checkpoint_epoch", "case_id", "fold", "stratum", "t", "intervention")
     grouped = defaultdict(list)
     for row in patch_rows:
         grouped[tuple(row[key] for key in keys)].append(row)
@@ -579,17 +618,19 @@ def summarize_probe(rows, audit, exclusions, bootstrap_iterations):
         for row in patch_rows:
             if row.get(metric) is None:
                 continue
-            key = (row["checkpoint_epoch"], row["stratum"], row["t"], row["intervention"])
+            key = (row["checkpoint_label"], row["stratum"], row["t"], row["intervention"])
             valid_key = {"rel_delta": "rel_delta_valid", "cosine": "cosine_valid",
                          "r2": "r2_valid"}.get(metric)
             groups[key].append({"case_id": row["case_id"], "value": row[metric],
                                 "valid": row.get(valid_key, True), "flag": row["validity_flag"]})
         aggregate[metric] = {
-            f"epoch={key[0]}|stratum={key[1]}|t={key[2]:.2f}|intervention={key[3]}":
+            f"checkpoint={key[0]}|stratum={key[1]}|t={key[2]:.2f}|intervention={key[3]}":
             case_level_bootstrap(group, iterations=bootstrap_iterations,
                                  seed=SEEDS["bootstrap"] + index)
             for index, (key, group) in enumerate(sorted(groups.items()))}
     return {
+        **PROTOCOL_FLAGS,
+        "diagnostic_only": True,
         "claim_limit": CLAIM,
         "interpretation": {
             "probe_a": "Supporting diagnostic only; low large-t loss is not proof because x_t carries x1 information.",
@@ -647,7 +688,8 @@ def _radius_summary(pred, gt, spacing):
             "mae_mm": float(np.abs(difference).mean()), "valid": True}
 
 
-def thickening_metrics(prediction, ground_truth, spacing, *, case_id, epoch):
+def thickening_metrics(prediction, ground_truth, spacing, *, case_id,
+                       checkpoint_label, internal_epoch):
     spacing = np.asarray(spacing, np.float64)
     radius_mm = float(np.mean(spacing))
     structure = _physical_ball(spacing, radius_mm)
@@ -658,7 +700,9 @@ def thickening_metrics(prediction, ground_truth, spacing, *, case_id, epoch):
         for stage, mask in (("before", pred), ("after_erosion", eroded)):
             surface = _surface_summary(mask, gt, spacing)
             radius = _radius_summary(mask, gt, spacing)
-            rows.append({"checkpoint_epoch": epoch, "case_id": case_id, "side": side,
+            rows.append({"checkpoint_label": checkpoint_label,
+                         "checkpoint_epoch": internal_epoch,
+                         "case_id": case_id, "side": side,
                          "stage": stage, "erosion_radius_mm": radius_mm,
                          "spacing_z": spacing[0], "spacing_y": spacing[1],
                          "spacing_x": spacing[2], "dice": dice(mask, gt),
@@ -693,53 +737,62 @@ def render_figure(path, rows, thickening_rows, summary):
     matplotlib.rcParams.update({"font.size": 8, "axes.titlesize": 9, "axes.labelsize": 8,
                                  "xtick.labelsize": 8, "ytick.labelsize": 8,
                                  "legend.fontsize": 7, "pdf.fonttype": 42})
-    palette = {0: "#0072B2", 25: "#E69F00", 125: "#009E73"}
+    palette = {"best_legacy_unknown_epoch": "#0072B2", "epoch_129": "#E69F00"}
     patch_rows = [r for r in rows if r["aggregation_level"] == "patch"]
     fig, axes = plt.subplots(2, 2, figsize=(7.2, 5.4))
     ax = axes[0, 0]
-    for epoch in CHECKPOINT_EPOCHS:
+    for checkpoint_label in CHECKPOINT_LABELS:
         for stratum, line in (("foreground", "-"), ("pure_background", "--")):
             points = [(t, np.mean([r["fm_loss"] for r in patch_rows
-                                   if r["checkpoint_epoch"] == epoch and r["stratum"] == stratum
+                                   if r["checkpoint_label"] == checkpoint_label and r["stratum"] == stratum
                                    and r["intervention"] == "full" and r["t"] == t]))
                       for t in T_GRID]
-            ax.plot(*zip(*points), line, color=palette[epoch], marker="o", ms=2,
-                    label=f"ep {epoch}, {stratum.replace('_', ' ')}")
-    ax.set(xscale="log", yscale="log", xlabel="t", ylabel="FM MSE", title="A  Loss profile")
+            ax.plot(*zip(*points), line, color=palette[checkpoint_label], marker="o", ms=2,
+                    label=f"{checkpoint_label}, {stratum.replace('_', ' ')}")
+    ax.set(xscale="log", yscale="log", xlabel="t", ylabel="FM MSE",
+           title="A  Checkpoint-based t profile")
     ax.grid(alpha=.2); ax.legend(ncol=2)
     ax = axes[0, 1]
     styles = {"cbct_zero": "-", "cbct_noise": "--", "cbct_shuffle": ":"}
-    for epoch in CHECKPOINT_EPOCHS:
+    for checkpoint_label in CHECKPOINT_LABELS:
         for intervention, line in styles.items():
             values = [(t, np.mean([r["rel_delta"] for r in patch_rows
-                                   if r["checkpoint_epoch"] == epoch and r["stratum"] == "foreground"
+                                   if r["checkpoint_label"] == checkpoint_label and r["stratum"] == "foreground"
                                    and r["intervention"] == intervention and r["t"] == t]))
                       for t in T_GRID]
-            ax.plot(*zip(*values), line, color=palette[epoch], label=f"ep {epoch} {intervention[5:]}")
+            ax.plot(*zip(*values), line, color=palette[checkpoint_label],
+                    label=f"{checkpoint_label} {intervention[5:]}")
     ax.set(xlabel="t", ylabel="relative output change", title="B  CBCT causal ablation")
     ax.grid(alpha=.2); ax.legend(ncol=3)
     ax = axes[1, 0]
-    for epoch in CHECKPOINT_EPOCHS:
+    for checkpoint_label in CHECKPOINT_LABELS:
         cosine = [(t, np.mean([r["cosine"] for r in patch_rows
-                               if r["checkpoint_epoch"] == epoch and r["stratum"] == "foreground"
+                               if r["checkpoint_label"] == checkpoint_label and r["stratum"] == "foreground"
                                and r["intervention"] == "full" and r["t"] == t
                                and r["cosine"] is not None])) for t in T_GRID]
         prior = [(t, np.mean([r["rel_delta"] for r in patch_rows
-                              if r["checkpoint_epoch"] == epoch and r["stratum"] == "foreground"
+                              if r["checkpoint_label"] == checkpoint_label and r["stratum"] == "foreground"
                               and r["intervention"] == "prior_swap" and r["t"] == t]))
                  for t in T_GRID]
-        ax.plot(*zip(*cosine), "-", color=palette[epoch], label=f"cosine ep {epoch}")
-        ax.plot(*zip(*prior), "--", color=palette[epoch], label=f"prior swap ep {epoch}")
+        ax.plot(*zip(*cosine), "-", color=palette[checkpoint_label],
+                label=f"cosine {checkpoint_label}")
+        ax.plot(*zip(*prior), "--", color=palette[checkpoint_label],
+                label=f"prior swap {checkpoint_label}")
     ax.set(xlabel="t", ylabel="similarity / sensitivity", title="C  Shortcut and prior probes")
     ax.grid(alpha=.2); ax.legend(ncol=2)
     ax = axes[1, 1]
     if thickening_rows:
-        before = [r["dice"] for r in thickening_rows if r["stage"] == "before"]
-        after = [r["dice"] for r in thickening_rows if r["stage"] == "after_erosion"]
+        values, labels = [], []
+        for checkpoint_label in CHECKPOINT_LABELS:
+            for stage in ("before", "after_erosion"):
+                values.append([r["dice"] for r in thickening_rows
+                               if r["checkpoint_label"] == checkpoint_label and r["stage"] == stage])
+                labels.append(f"{checkpoint_label}\n{stage.replace('_', ' ')}")
         try:
-            ax.boxplot([before, after], tick_labels=["before", "after erosion"], showfliers=True)
+            ax.boxplot(values, tick_labels=labels, showfliers=True)
         except TypeError:  # matplotlib < 3.9
-            ax.boxplot([before, after], labels=["before", "after erosion"], showfliers=True)
+            ax.boxplot(values, labels=labels, showfliers=True)
+        ax.tick_params(axis="x", labelrotation=20)
         ax.set(ylabel="Dice", title="D  Physical erosion compatibility")
     else:
         ax.text(.5, .5, "No thickening rows", ha="center", va="center")
@@ -756,10 +809,13 @@ def validate_staged_artifacts(directory):
         path = directory / name
         if not path.is_file() or path.stat().st_size == 0:
             raise ValueError(f"missing/empty staged artifact: {path}")
-    if not (directory / "fig1_shortcut.pdf").read_bytes().startswith(b"%PDF"):
+    if not (directory / "limited_endpoint_diagnostic.pdf").read_bytes().startswith(b"%PDF"):
         raise ValueError("figure is not a PDF")
-    json.loads((directory / "shortcut_probe_summary.json").read_text())
-    json.loads((directory / "shortcut_probe_manifest.json").read_text())
+    summary = json.loads((directory / "shortcut_probe_summary.json").read_text())
+    manifest = json.loads((directory / "shortcut_probe_manifest.json").read_text())
+    for payload in (summary, manifest):
+        if any(payload.get(key) != value for key, value in PROTOCOL_FLAGS.items()):
+            raise ValueError("protocol-deviation metadata is missing or incorrect")
 
 
 def publish_artifacts(staged_directory, output_directory):
@@ -791,13 +847,15 @@ def generate_smoke_artifacts(directory):
     """Minimal known-data output path used by tests, never presented as a real result."""
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
     rows = []
-    for epoch in CHECKPOINT_EPOCHS:
+    internal_epochs = {"best_legacy_unknown_epoch": None, "epoch_129": 129}
+    for checkpoint_label in CHECKPOINT_LABELS:
         for stratum in ("foreground", "pure_background"):
             for t in T_GRID:
                 for intervention, delta in (("full", 0.0), ("cbct_zero", .01),
                                             ("cbct_noise", .02), ("cbct_shuffle", .015),
                                             ("prior_zero", .5), ("prior_swap", .6)):
-                    rows.append({"aggregation_level": "patch", "checkpoint_epoch": epoch,
+                    rows.append({"aggregation_level": "patch", "checkpoint_label": checkpoint_label,
+                                 "checkpoint_epoch": internal_epochs[checkpoint_label],
                                  "case_id": "synthetic", "fold": 0, "stratum": stratum,
                                  "patch_index": 0, "patch_z": 0, "patch_y": 0, "patch_x": 0,
                                  "t": t, "seed": 1, "intervention": intervention,
@@ -807,15 +865,20 @@ def generate_smoke_artifacts(directory):
                                  "cosine_valid": True, "r2": .98 if intervention == "full" else None,
                                  "r2_valid": True, "validity_flag": "ok"})
     thick = []
-    for stage, value in (("before", .8), ("after_erosion", .9)):
-        thick.append({"checkpoint_epoch": 125, "case_id": "synthetic", "side": 1,
-                      "stage": stage, "dice": value})
-    summary = {"claim_limit": CLAIM, "synthetic_smoke_test": True}
+    for checkpoint_label in CHECKPOINT_LABELS:
+        for stage, value in (("before", .8), ("after_erosion", .9)):
+            thick.append({"checkpoint_label": checkpoint_label,
+                          "checkpoint_epoch": internal_epochs[checkpoint_label],
+                          "case_id": "synthetic", "side": 1,
+                          "stage": stage, "dice": value})
+    summary = {**PROTOCOL_FLAGS, "diagnostic_only": True,
+               "claim_limit": CLAIM, "synthetic_smoke_test": True}
     _csv_write(directory / "shortcut_probe.csv", rows)
     _csv_write(directory / "thickening_probe.csv", thick)
     _json_write(directory / "shortcut_probe_summary.json", summary)
-    render_figure(directory / "fig1_shortcut.pdf", rows, thick, summary)
-    manifest = {"synthetic_smoke_test": True, "created_at": utcnow(), "artifacts": {}}
+    render_figure(directory / "limited_endpoint_diagnostic.pdf", rows, thick, summary)
+    manifest = {**PROTOCOL_FLAGS, "diagnostic_only": True,
+                "synthetic_smoke_test": True, "created_at": utcnow(), "artifacts": {}}
     for name in OUTPUT_NAMES[:-1]:
         manifest["artifacts"][name] = sha256_file(directory / name)
     _json_write(directory / "shortcut_probe_manifest.json", manifest)
@@ -826,13 +889,15 @@ def _parse_checkpoints(values):
     parsed = {}
     for value in values:
         try:
-            epoch, path = value.split("=", 1)
-            parsed[int(epoch)] = Path(path)
+            checkpoint_label, path = value.split("=", 1)
+            if checkpoint_label in parsed:
+                raise ValueError("duplicate checkpoint label")
+            parsed[checkpoint_label] = Path(path)
         except Exception as error:
             raise argparse.ArgumentTypeError(f"invalid checkpoint mapping {value!r}") from error
-    missing = set(CHECKPOINT_EPOCHS) - set(parsed)
-    if missing:
-        raise ReadinessError(f"checkpoint mappings missing epochs: {sorted(missing)}")
+    if set(parsed) != set(CHECKPOINT_LABELS):
+        raise ReadinessError(
+            f"checkpoint mappings must be exactly {list(CHECKPOINT_LABELS)}; got {sorted(parsed)}")
     return parsed
 
 
@@ -852,7 +917,7 @@ def run(args):
     device = torch.device(args.device)
     with open(args.splits) as handle:
         fold = json.load(handle)["folds"][0]
-    patch = int(audit["checkpoints"]["0"]["contract"]["patch"])
+    patch = int(audit["checkpoints"][CHECKPOINT_LABELS[0]]["contract"]["patch"])
     grid, exclusions = build_patch_grid(fold["val"], args.images, args.gt_sdf,
                                         args.coarse_sdf, patch=patch, cases=args.cases,
                                         patches_per_stratum=args.patches_per_stratum,
@@ -868,32 +933,38 @@ def run(args):
     cases = {case_id: _load_case(case_id, args.images, args.gt_sdf, args.coarse_sdf,
                                  args.labels) for case_id in selected_ids}
     signature = {"schema_version": 1,
-                 "checkpoints": {epoch: audit["checkpoints"][str(epoch)]["sha256"]
-                                 for epoch in CHECKPOINT_EPOCHS},
+                 "checkpoints": {label: audit["checkpoints"][label]["sha256"]
+                                 for label in CHECKPOINT_LABELS},
                  "identity": audit["identity_baseline"]["sha256"],
                  "config_hash": audit["resolved_config_hash"],
                  "patch_grid_hash": canonical_hash(grid), "donor_map": donor_map,
                  "t_grid": T_GRID, "seeds": SEEDS}
     work_dir = _prepare_work_dir(
-        args.work_dir or (Path(args.output_dir).parent / ".shortcut_probe_work"), signature)
+        args.work_dir or (Path(args.output_dir).parent / ".limited_endpoint_probe_work"), signature)
     patch_rows, batch_size = [], args.batch_size
-    for epoch in CHECKPOINT_EPOCHS:
-        checkpoint = torch.load(checkpoints[epoch], map_location="cpu", weights_only=False)
+    for checkpoint_label in CHECKPOINT_LABELS:
+        internal_epoch = audit["checkpoints"][checkpoint_label]["internal_epoch"]
+        checkpoint = torch.load(checkpoints[checkpoint_label], map_location="cpu", weights_only=False)
         model, _ = _resolved_model_contract(checkpoint); model.to(device).eval()
         for item in grid:
-            shard = work_dir / "patches" / f"epoch_{epoch:03d}_patch_{item['patch_index']:03d}_{item['case_id']}.json"
+            shard = work_dir / "patches" / (
+                f"{checkpoint_label}_patch_{item['patch_index']:03d}_{item['case_id']}.json")
             if shard.is_file():
-                patch_rows.extend(_load_patch_shard(shard, item, epoch))
+                patch_rows.extend(_load_patch_shard(
+                    shard, item, checkpoint_label, internal_epoch))
                 continue
             case = cases[item["case_id"]]
             donor_id = donor_map[item["case_id"]]
             donor = {**cases[donor_id], "case_id": donor_id}
             shard_rows = []
             for t in T_GRID:
-                produced, batch_size = probe_patch(model, epoch, item, case, donor,
-                                                   t, device, batch_size)
+                produced, batch_size = probe_patch(
+                    model, checkpoint_label, internal_epoch, item, case, donor,
+                    t, device, batch_size)
                 shard_rows.extend(produced)
-            _atomic_json_new(shard, {"epoch": epoch, "case_id": item["case_id"],
+            _atomic_json_new(shard, {"checkpoint_label": checkpoint_label,
+                                     "internal_epoch": internal_epoch,
+                                     "case_id": item["case_id"],
                                      "patch_index": item["patch_index"],
                                      "start": item["start"], "rows": shard_rows})
             patch_rows.extend(shard_rows)
@@ -901,39 +972,50 @@ def run(args):
         if device.type == "cuda":
             torch.cuda.empty_cache()
     rows = add_case_rows(patch_rows)
-    # Probe D uses the exact epoch-125 model and selected cases, never patch outputs.
-    checkpoint = torch.load(checkpoints[125], map_location="cpu", weights_only=False)
-    model, contract = _resolved_model_contract(checkpoint); model.to(device).eval()
+    # Probe D evaluates both historical endpoints independently on the same cases.
     thickening_rows = []
-    for case_id in selected_ids[:args.thickening_cases]:
-        shard = work_dir / "thickening" / f"epoch_125_{case_id}.json"
-        if shard.is_file():
-            payload = json.loads(shard.read_text())
-            if payload.get("case_id") != case_id or len(payload.get("rows", ())) != 4:
-                raise ReadinessError(f"invalid/incompatible thickening shard: {shard}")
-            thickening_rows.extend(payload["rows"])
-            continue
-        case = cases[case_id]
-        endpoint = predict_volume(model, case["cond"], case["x0"], patch=patch,
-                                  steps=contract["ode_steps"], device=str(device))
-        prediction = sdf_stack_to_mask(endpoint)
-        shard_rows = thickening_metrics(prediction, case["label"], case["spacing"],
-                                        case_id=case_id, epoch=125)
-        _atomic_json_new(shard, {"case_id": case_id, "rows": shard_rows})
-        thickening_rows.extend(shard_rows)
-    del model
+    for checkpoint_label in CHECKPOINT_LABELS:
+        internal_epoch = audit["checkpoints"][checkpoint_label]["internal_epoch"]
+        checkpoint = torch.load(checkpoints[checkpoint_label], map_location="cpu", weights_only=False)
+        model, contract = _resolved_model_contract(checkpoint); model.to(device).eval()
+        for case_id in selected_ids[:args.thickening_cases]:
+            shard = work_dir / "thickening" / f"{checkpoint_label}_{case_id}.json"
+            if shard.is_file():
+                payload = json.loads(shard.read_text())
+                if (payload.get("checkpoint_label") != checkpoint_label
+                        or payload.get("internal_epoch") != internal_epoch
+                        or payload.get("case_id") != case_id
+                        or len(payload.get("rows", ())) != 4):
+                    raise ReadinessError(f"invalid/incompatible thickening shard: {shard}")
+                thickening_rows.extend(payload["rows"])
+                continue
+            case = cases[case_id]
+            endpoint = predict_volume(model, case["cond"], case["x0"], patch=patch,
+                                      steps=contract["ode_steps"], device=str(device))
+            prediction = sdf_stack_to_mask(endpoint)
+            shard_rows = thickening_metrics(
+                prediction, case["label"], case["spacing"], case_id=case_id,
+                checkpoint_label=checkpoint_label, internal_epoch=internal_epoch)
+            _atomic_json_new(shard, {"checkpoint_label": checkpoint_label,
+                                     "internal_epoch": internal_epoch,
+                                     "case_id": case_id, "rows": shard_rows})
+            thickening_rows.extend(shard_rows)
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     summary = summarize_probe(rows, audit, exclusions, args.bootstrap_iterations)
     summary["thickening"] = {
         "cases": len({row["case_id"] for row in thickening_rows}),
         "interpretation_limit": "Observed recovery may be compatible with uniform thickening; it is not fully explained by this probe."}
     temp_parent = Path(args.local_temp_parent); temp_parent.mkdir(parents=True, exist_ok=True)
-    staged = Path(tempfile.mkdtemp(prefix="shortcut_probe_", dir=temp_parent))
+    staged = Path(tempfile.mkdtemp(prefix="limited_endpoint_probe_", dir=temp_parent))
     _csv_write(staged / "shortcut_probe.csv", rows)
     _csv_write(staged / "thickening_probe.csv", thickening_rows)
     _json_write(staged / "shortcut_probe_summary.json", summary)
-    render_figure(staged / "fig1_shortcut.pdf", rows, thickening_rows, summary)
+    render_figure(staged / "limited_endpoint_diagnostic.pdf", rows, thickening_rows, summary)
     artifact_hashes = {name: sha256_file(staged / name) for name in OUTPUT_NAMES[:-1]}
-    manifest = {"git": audit["git"], "start_time": started_at, "end_time": utcnow(),
+    manifest = {**PROTOCOL_FLAGS, "diagnostic_only": True,
+                "git": audit["git"], "start_time": started_at, "end_time": utcnow(),
                 "python": platform.python_version(), "torch": torch.__version__,
                 "cuda_version": torch.version.cuda, "gpu": (torch.cuda.get_device_name(0)
                 if torch.cuda.is_available() else None), "device": str(device),
@@ -946,8 +1028,8 @@ def run(args):
     _json_write(staged / "shortcut_probe_manifest.json", manifest)
     validate_staged_artifacts(staged)
     # Immutable inputs must still match the readiness snapshot immediately before publication.
-    for epoch, path in checkpoints.items():
-        if sha256_file(path) != audit["checkpoints"][str(epoch)]["sha256"]:
+    for checkpoint_label, path in checkpoints.items():
+        if sha256_file(path) != audit["checkpoints"][checkpoint_label]["sha256"]:
             raise ReadinessError(f"checkpoint changed during probe: {path}")
     if sha256_file(args.identity_baseline) != audit["identity_baseline"]["sha256"]:
         raise ReadinessError("identity baseline changed during probe")
@@ -959,7 +1041,7 @@ def run(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", action="append", default=[], metavar="EPOCH=PATH")
+    parser.add_argument("--checkpoint", action="append", default=[], metavar="LABEL=PATH")
     parser.add_argument("--identity-baseline", required=True)
     parser.add_argument("--runs-root")
     parser.add_argument("--run-dir", help="explicitly proven legacy flow_fold0 run directory")
