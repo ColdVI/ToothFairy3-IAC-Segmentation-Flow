@@ -52,3 +52,10 @@ def test_notebook_validates_all_required_persistent_outputs():
                  "trajectory_metrics.pdf", "geometry_bias.pdf", "manifest.json"):
         assert name in text
     assert "PROMPT3R_ROOT = DRIVE_ROOT / 'outputs/prompt3r'" in text
+
+
+def test_drive_split_is_the_runtime_source_and_is_bound_to_fixed_panel_hash():
+    text = NOTEBOOK.read_text()
+    assert "'--splits', str(DRIVE_SPLITS)" in text
+    assert "panel_contract['source_splits_sha256'] == file_sha(DRIVE_SPLITS)" in text
+    assert "repo_splits" not in text
