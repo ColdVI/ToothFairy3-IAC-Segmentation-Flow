@@ -1,44 +1,25 @@
 {
-  "by_scanner": {
-    "F": [
-      "ToothFairy3F_025",
-      "ToothFairy3F_054",
-      "ToothFairy3F_052",
-      "ToothFairy3F_009",
-      "ToothFairy3F_023"
-    ],
-    "P": [
-      "ToothFairy3P_478",
-      "ToothFairy3P_398",
-      "ToothFairy3P_014",
-      "ToothFairy3P_359",
-      "ToothFairy3P_388"
-    ]
-  },
+  "case_list_sha256": "e51e3aa77ab6994529f260183b77d76bdde690d0ef37a9a596566d200c9c61a2",
   "fold": 0,
-  "full": [
-    "ToothFairy3F_025",
-    "ToothFairy3F_054",
+  "full_case_ids": [
     "ToothFairy3F_052",
     "ToothFairy3F_009",
-    "ToothFairy3F_023",
-    "ToothFairy3P_478",
-    "ToothFairy3P_398",
-    "ToothFairy3P_014",
-    "ToothFairy3P_359",
-    "ToothFairy3P_388"
-  ],
-  "full_cases_per_scanner": 5,
-  "quick": [
+    "ToothFairy3F_022",
     "ToothFairy3F_025",
-    "ToothFairy3F_054",
-    "ToothFairy3P_478",
-    "ToothFairy3P_398"
+    "ToothFairy3F_030",
+    "ToothFairy3P_239",
+    "ToothFairy3P_512",
+    "ToothFairy3P_330",
+    "ToothFairy3P_036",
+    "ToothFairy3P_206"
   ],
-  "quick_cases_per_scanner": 2,
-  "schema_version": 1,
-  "selection_method": "sha256(prompt3r:seed:case_id), scanner-stratified",
-  "selection_seed": 0,
-  "source_splits_path": "configs/splits.json",
+  "quick_case_ids": [
+    "ToothFairy3F_052",
+    "ToothFairy3F_009",
+    "ToothFairy3P_239",
+    "ToothFairy3P_512"
+  ],
+  "seed": 0,
+  "selection_algorithm": "sha256('prompt3r|seed=0|' + case_id), scanner-stratified",
   "source_splits_sha256": "85a8b74f947c8cd84a22a84afdece98ae6c8a6d48c695254a0cf8623a1c88b79"
 }

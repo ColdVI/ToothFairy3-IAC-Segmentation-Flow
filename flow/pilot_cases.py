@@ -18,7 +18,7 @@ def file_sha256(path):
 
 
 def _rank(case_id, seed):
-    return hashlib.sha256(f"prompt3r:{seed}:{case_id}".encode()).hexdigest()
+    return hashlib.sha256(f"prompt3r|seed={seed}|{case_id}".encode()).hexdigest()
 
 
 def select_pilot_cases(val_ids, *, seed=0, full_cases_per_scanner=5,
@@ -37,10 +37,7 @@ def select_pilot_cases(val_ids, *, seed=0, full_cases_per_scanner=5,
         selected = ranked[:full_cases_per_scanner]
         full.extend(selected)
         quick.extend(selected[:quick_cases_per_scanner])
-    return {"full": full, "quick": quick,
-            "by_scanner": {group: [case_id for case_id in full
-                                    if scanner_group(case_id) == group]
-                           for group in ("F", "P")}}
+    return {"full_case_ids": full, "quick_case_ids": quick}
 
 
 def build_pilot_case_manifest(splits_path, *, fold=0, seed=0,
@@ -52,12 +49,12 @@ def build_pilot_case_manifest(splits_path, *, fold=0, seed=0,
         splits["folds"][fold]["val"], seed=seed,
         full_cases_per_scanner=full_cases_per_scanner,
         quick_cases_per_scanner=quick_cases_per_scanner)
-    return {"schema_version": 1, "fold": int(fold), "selection_seed": int(seed),
-            "selection_method": "sha256(prompt3r:seed:case_id), scanner-stratified",
-            "source_splits_path": str(splits_path),
+    case_list_payload = json.dumps(selected, sort_keys=True, separators=(",", ":"))
+    return {"fold": int(fold), "seed": int(seed),
+            "selection_algorithm": "sha256('prompt3r|seed=0|' + case_id), scanner-stratified",
             "source_splits_sha256": file_sha256(splits_path),
-            "quick_cases_per_scanner": int(quick_cases_per_scanner),
-            "full_cases_per_scanner": int(full_cases_per_scanner), **selected}
+            "case_list_sha256": hashlib.sha256(case_list_payload.encode()).hexdigest(),
+            **selected}
 
 
 def write_manifest_no_overwrite(path, manifest):

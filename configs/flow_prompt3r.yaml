@@ -1,0 +1,72 @@
+# Prompt 3R Flow-v2 Fold-0 pilot template. Runtime resolution must fill the
+# prior_floor verbatim from a complete Prompt-1 identity JSON.
+seed: 0
+base: 32
+zero_init_head: true
+cond_include_coarse_sdf: false
+legacy_compatibility: false
+training_objective: prompt3r_t0
+
+selection_policy: paired_identity
+noninferiority_margin: 0.005
+
+epochs: 15
+patch: 96
+batch_size: 2
+num_workers: 4
+fg_prob: 0.8
+ode_steps: 8
+lr: 1.0e-4
+weight_decay: 1.0e-5
+sdf_clip_mm: 10.0
+
+checkpoint_every: 1
+immutable_epoch_checkpoints_until: 15
+
+t_sampling: mixed_low_t
+low_t_fraction: 0.5
+low_t_max: 0.25
+random_t_aux_enabled: false
+
+occ_tau: 0.05
+narrowband_band: 0.2
+cldice_iters: 10
+w_t0_endpoint: 1.0
+w_t0_sdf: 1.0
+w_t0_narrowband: 1.0
+w_t0_softdice: 1.0
+w_t0_cldice: 0.5
+w_laterality: 0.0
+w_tv: 0.0
+
+prior_perturbation:
+  enabled: true
+  probability: 0.5
+  max_sdf_offset_mm: 0.3
+  max_translation_mm: 0.3
+  sdf_noise_std_mm: 0.05
+
+pilot_validation:
+  selection_seed: 0
+  quick_cases_per_scanner: 2
+  full_cases_per_scanner: 5
+  full_epochs: [0, 5, 10, 15]
+
+paired_safety_gate:
+  min_mean_delta_dice: -0.005
+  min_mean_delta_cldice: -0.002
+  require_hd95_or_gap_improvement: true
+  max_extra_abs_volume_bias: 0.03
+  max_extra_abs_radius_bias_mm: 0.10
+  max_extra_catastrophic_hd95_cases: 0
+  max_extra_lr_swaps: 0
+  catastrophic_hd95_threshold_mm: 10.0
+
+prior_floor:
+  complete_cv: null
+  dice: null
+  cldice: null
+  hd95: null
+  score: null
+  source_json: null
+  source_sha256: null

@@ -65,12 +65,11 @@ def validation_rows(model, val_ids, images_dir, coarse_sdf_dir, gt_labels_dir,
     return rows
 
 
-CORE_METRICS = ("dice", "cldice", "hd95", "gap_mm", "betti0")
+CORE_METRICS = ("dice", "cldice", "hd95_mm", "gap_mm", "betti0")
 GEOMETRY_METRICS = (
-    "volume_ratio", "signed_surface_mean_mm", "signed_surface_median_mm",
-    "signed_surface_q05_mm", "signed_surface_q95_mm", "radius_bias_mm",
-    "radius_mae_mm", "connected_component_count", "fp_component_count",
-    "max_fp_distance_mm",
+    "volume_ratio", "signed_surface_mean_mm", "radius_bias_mm",
+    "connected_components", "false_positive_component_count",
+    "max_false_positive_distance_mm",
 )
 
 
@@ -85,17 +84,28 @@ def scanner_group(case_id):
 def _side_metrics(pred, gt, spacing):
     values = {
         "dice": dice(pred, gt), "cldice": cldice(pred, gt),
-        "hd95": hd95(pred, gt, spacing),
+        "hd95_mm": hd95(pred, gt, spacing),
         "gap_mm": centerline_gap_length(pred, gt, spacing),
         "betti0": betti0_error(pred),
     }
-    values.update(side_geometry_metrics(pred, gt, spacing))
+    geometry = side_geometry_metrics(pred, gt, spacing)
+    values.update({
+        "volume_ratio": geometry["volume_ratio"],
+        "signed_surface_mean_mm": geometry["signed_surface_mean_mm"],
+        "radius_bias_mm": geometry["radius_bias_mm"],
+        "connected_components": geometry["connected_component_count"],
+        "false_positive_component_count": geometry["fp_component_count"],
+        "max_false_positive_distance_mm": geometry["max_fp_distance_mm"],
+        "geometry_valid": geometry["geometry_valid"],
+        "geometry_reason": geometry["geometry_reason"],
+    })
     return values
 
 
 def paired_validation_rows(model, val_ids, images_dir, coarse_sdf_dir,
                            gt_labels_dir, patch=96, steps=8, device="cpu",
-                           progress=False, conditioning_spec=None):
+                           progress=False, conditioning_spec=None, *, epoch=None,
+                           validation_tier=None):
     """Evaluate identity and flow on exactly the same cases and full-volume path."""
     if not val_ids:
         raise ValueError("paired validation requires at least one case")
@@ -116,9 +126,10 @@ def paired_validation_rows(model, val_ids, images_dir, coarse_sdf_dir,
             identity = _side_metrics(identity_label == side, gt_label == side, spacing)
             flow = _side_metrics(flow_label == side, gt_label == side, spacing)
             row = {"case_id": sid, "scanner_group": scanner_group(sid), "side": side,
-                   "identity_lr_swap_rate": identity_swap,
-                   "flow_lr_swap_rate": flow_swap,
-                   "delta_lr_swap_rate": flow_swap - identity_swap}
+                   "epoch": epoch, "validation_tier": validation_tier,
+                   "identity_lr_swap": identity_swap,
+                   "flow_lr_swap": flow_swap,
+                   "delta_lr_swap": flow_swap - identity_swap}
             for name in CORE_METRICS + GEOMETRY_METRICS:
                 row[f"identity_{name}"] = identity[name]
                 row[f"flow_{name}"] = flow[name]
@@ -134,8 +145,8 @@ def paired_validation_rows(model, val_ids, images_dir, coarse_sdf_dir,
                        for name in CORE_METRICS + GEOMETRY_METRICS]
             if any(value is None or not math.isfinite(float(value)) for value in numeric):
                 reasons.append("nonfinite_metric")
-            row["valid"] = not reasons
-            row["validity_reason"] = "ok" if not reasons else ";".join(sorted(set(reasons)))
+            row["metric_valid"] = not reasons
+            row["exclusion_reason"] = "" if not reasons else ";".join(sorted(set(reasons)))
             rows.append(row)
         if progress:
             print(f"[paired-validate] {case_index}/{len(val_ids)} {sid}", flush=True)
@@ -152,7 +163,7 @@ def paired_case_rows(rows, *, catastrophic_hd95_mm=10.0):
         reasons = []
         if sorted(row["side"] for row in side_rows) != [1, 2]:
             reasons.append("requires_exactly_two_anatomical_sides")
-        reasons.extend(row["validity_reason"] for row in side_rows if not row["valid"])
+        reasons.extend(row["exclusion_reason"] for row in side_rows if not row["metric_valid"])
         case = {"case_id": case_id, "scanner_group": side_rows[0]["scanner_group"]}
         for prefix in ("identity", "flow", "delta"):
             for name in CORE_METRICS + GEOMETRY_METRICS:
@@ -162,22 +173,22 @@ def paired_case_rows(rows, *, catastrophic_hd95_mm=10.0):
                 else:
                     case[f"{prefix}_{name}"] = float(sum(values) / len(values))
         for prefix in ("identity", "flow", "delta"):
-            key = f"{prefix}_lr_swap_rate"
+            key = f"{prefix}_lr_swap"
             values = {float(row[key]) for row in side_rows}
             case[key] = values.pop() if len(values) == 1 else None
             if case[key] is None:
                 reasons.append("inconsistent_case_lr_swap_rate")
         identity_catastrophic = any(
-            float(row["identity_hd95"]) > catastrophic_hd95_mm for row in side_rows
-            if row["identity_hd95"] is not None)
+            float(row["identity_hd95_mm"]) > catastrophic_hd95_mm for row in side_rows
+            if row["identity_hd95_mm"] is not None)
         flow_catastrophic = any(
-            float(row["flow_hd95"]) > catastrophic_hd95_mm for row in side_rows
-            if row["flow_hd95"] is not None)
+            float(row["flow_hd95_mm"]) > catastrophic_hd95_mm for row in side_rows
+            if row["flow_hd95_mm"] is not None)
         case["identity_catastrophic_hd95"] = int(identity_catastrophic)
         case["flow_catastrophic_hd95"] = int(flow_catastrophic)
         case["extra_catastrophic_hd95"] = int(flow_catastrophic) - int(identity_catastrophic)
-        case["identity_lr_swap_case"] = int((case["identity_lr_swap_rate"] or 0) > 0)
-        case["flow_lr_swap_case"] = int((case["flow_lr_swap_rate"] or 0) > 0)
+        case["identity_lr_swap_case"] = int((case["identity_lr_swap"] or 0) > 0)
+        case["flow_lr_swap_case"] = int((case["flow_lr_swap"] or 0) > 0)
         case["extra_lr_swap_case"] = case["flow_lr_swap_case"] - case["identity_lr_swap_case"]
         case["valid"] = not reasons
         case["validity_reason"] = "ok" if not reasons else ";".join(sorted(set(reasons)))
@@ -188,7 +199,7 @@ def paired_case_rows(rows, *, catastrophic_hd95_mm=10.0):
 def paired_identity_safety_gate(rows, config=None):
     """Apply the predeclared Prompt-3R non-inferiority/safety contract."""
     cfg = config or {}
-    threshold = float(cfg.get("catastrophic_hd95_mm", 10.0))
+    threshold = float(cfg.get("catastrophic_hd95_threshold_mm", 10.0))
     cases = paired_case_rows(rows, catastrophic_hd95_mm=threshold)
     invalid = [case for case in cases if not case["valid"]]
     criteria = {"all_cases_valid": not invalid}
@@ -206,7 +217,7 @@ def paired_identity_safety_gate(rows, config=None):
     aggregate = {
         "mean_delta_dice": mean("delta_dice"),
         "mean_delta_cldice": mean("delta_cldice"),
-        "mean_delta_hd95": mean("delta_hd95"),
+        "mean_delta_hd95_mm": mean("delta_hd95_mm"),
         "mean_delta_gap_mm": mean("delta_gap_mm"),
         "extra_abs_volume_bias": float(sum(
             abs(float(case["flow_volume_ratio"]) - 1.0)
@@ -234,14 +245,16 @@ def paired_identity_safety_gate(rows, config=None):
             cfg.get("min_mean_delta_dice", -0.005)),
         "mean_delta_cldice": aggregate["mean_delta_cldice"] >= float(
             cfg.get("min_mean_delta_cldice", -0.002)),
-        "hd95_or_gap_improves": (aggregate["mean_delta_hd95"] < 0 or
+        "hd95_or_gap_improves": (aggregate["mean_delta_hd95_mm"] < 0 or
                                  aggregate["mean_delta_gap_mm"] < 0),
         "extra_abs_volume_bias": aggregate["extra_abs_volume_bias"] <= float(
             cfg.get("max_extra_abs_volume_bias", 0.03)),
         "extra_abs_radius_bias": aggregate["extra_abs_radius_bias_mm"] <= float(
             cfg.get("max_extra_abs_radius_bias_mm", 0.10)),
-        "extra_catastrophic_hd95": aggregate["extra_catastrophic_hd95_cases"] <= 0,
-        "extra_lr_swaps": aggregate["extra_lr_swap_cases"] <= 0,
+        "extra_catastrophic_hd95": aggregate["extra_catastrophic_hd95_cases"] <= int(
+            cfg.get("max_extra_catastrophic_hd95_cases", 0)),
+        "extra_lr_swaps": aggregate["extra_lr_swap_cases"] <= int(
+            cfg.get("max_extra_lr_swaps", 0)),
     })
     return {"safe": all(criteria.values()), "criteria": criteria,
             "aggregate": aggregate, "case_rows": cases, "invalid_cases": []}
