@@ -1,0 +1,44 @@
+{
+  "by_scanner": {
+    "F": [
+      "ToothFairy3F_025",
+      "ToothFairy3F_054",
+      "ToothFairy3F_052",
+      "ToothFairy3F_009",
+      "ToothFairy3F_023"
+    ],
+    "P": [
+      "ToothFairy3P_478",
+      "ToothFairy3P_398",
+      "ToothFairy3P_014",
+      "ToothFairy3P_359",
+      "ToothFairy3P_388"
+    ]
+  },
+  "fold": 0,
+  "full": [
+    "ToothFairy3F_025",
+    "ToothFairy3F_054",
+    "ToothFairy3F_052",
+    "ToothFairy3F_009",
+    "ToothFairy3F_023",
+    "ToothFairy3P_478",
+    "ToothFairy3P_398",
+    "ToothFairy3P_014",
+    "ToothFairy3P_359",
+    "ToothFairy3P_388"
+  ],
+  "full_cases_per_scanner": 5,
+  "quick": [
+    "ToothFairy3F_025",
+    "ToothFairy3F_054",
+    "ToothFairy3P_478",
+    "ToothFairy3P_398"
+  ],
+  "quick_cases_per_scanner": 2,
+  "schema_version": 1,
+  "selection_method": "sha256(prompt3r:seed:case_id), scanner-stratified",
+  "selection_seed": 0,
+  "source_splits_path": "configs/splits.json",
+  "source_splits_sha256": "85a8b74f947c8cd84a22a84afdece98ae6c8a6d48c695254a0cf8623a1c88b79"
+}

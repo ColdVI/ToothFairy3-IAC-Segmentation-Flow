@@ -39,6 +39,8 @@ for item in (ROOT, ROOT / "data", ROOT / "flow"):
 
 from data.io_utils import (normalize_coords, physical_coord_grid,  # noqa: E402
                            sdf_stack_to_mask, voxel_spacing)
+from evaluation.geometry_metrics import (radius_profile_summary,  # noqa: E402
+                                         signed_surface_distance_summary)
 from evaluation.metrics import _surface_distances, dice, hd95  # noqa: E402
 from flow.conditioning import build_conditioning  # noqa: E402
 from flow.channel_contract import (resolve_conditioning_spec,                # noqa: E402
@@ -672,31 +674,6 @@ def _physical_ball(spacing, radius_mm):
     return distance2 <= radius_mm ** 2 + 1e-12
 
 
-def _surface_summary(pred, gt, spacing):
-    from scipy.ndimage import binary_erosion as erode
-    surface = pred.astype(bool) & ~erode(pred.astype(bool))
-    if not surface.any() or not gt.any():
-        return {key: None for key in ("mean", "median", "q05", "q95")}
-    outside = distance_transform_edt(~gt.astype(bool), sampling=spacing)
-    inside = distance_transform_edt(gt.astype(bool), sampling=spacing)
-    signed = outside.copy(); signed[gt.astype(bool)] = -inside[gt.astype(bool)]
-    values = signed[surface]
-    return {"mean": float(values.mean()), "median": float(np.median(values)),
-            "q05": float(np.percentile(values, 5)), "q95": float(np.percentile(values, 95))}
-
-
-def _radius_summary(pred, gt, spacing):
-    from evaluation.metrics import _skeletonize
-    skeleton = _skeletonize(gt)
-    if not skeleton.any():
-        return {"signed_mean_mm": None, "mae_mm": None, "valid": False}
-    gt_radius = distance_transform_edt(gt, sampling=spacing)[skeleton]
-    pred_radius = distance_transform_edt(pred, sampling=spacing)[skeleton]
-    difference = pred_radius - gt_radius
-    return {"signed_mean_mm": float(difference.mean()),
-            "mae_mm": float(np.abs(difference).mean()), "valid": True}
-
-
 def thickening_metrics(prediction, ground_truth, spacing, *, case_id,
                        checkpoint_label, internal_epoch):
     spacing = np.asarray(spacing, np.float64)
@@ -707,8 +684,8 @@ def thickening_metrics(prediction, ground_truth, spacing, *, case_id,
         pred = prediction == side; gt = ground_truth == side
         eroded = binary_erosion(pred, structure=structure)
         for stage, mask in (("before", pred), ("after_erosion", eroded)):
-            surface = _surface_summary(mask, gt, spacing)
-            radius = _radius_summary(mask, gt, spacing)
+            surface = signed_surface_distance_summary(mask, gt, spacing)
+            radius = radius_profile_summary(mask, gt, spacing)
             rows.append({"checkpoint_label": checkpoint_label,
                          "checkpoint_epoch": internal_epoch,
                          "case_id": case_id, "side": side,
@@ -717,7 +694,7 @@ def thickening_metrics(prediction, ground_truth, spacing, *, case_id,
                          "spacing_x": spacing[2], "dice": dice(mask, gt),
                          "hd95_mm": hd95(mask, gt, spacing),
                          "prediction_gt_volume_ratio": float(mask.sum() / max(int(gt.sum()), 1)),
-                         **{f"signed_surface_{key}_mm": value for key, value in surface.items()},
+                         **{f"signed_surface_{key}": value for key, value in surface.items()},
                          "radius_profile_signed_mean_mm": radius["signed_mean_mm"],
                          "radius_profile_mae_mm": radius["mae_mm"],
                          "radius_profile_valid": radius["valid"]})
