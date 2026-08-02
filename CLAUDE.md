@@ -70,20 +70,69 @@ The existing fold-0 progress artifact reports:
 The artifact shows falling training loss together with lower validation Dice and
 higher HD95 than its epoch-0 row. It does **not** establish why. Its precise case
 set and OOF provenance must be audited before using it as paper evidence.
+Historical immutable per-epoch checkpoints were not saved: the progress rows do
+not make an exact checkpoint trajectory recoverable, and no epoch-0, epoch-25,
+or epoch-125 checkpoint may be inferred or reconstructed from them.
 
-### 2.3 Prompt-1 cache and identity preflight state
+### 2.3 Prompt-1 complete identity baseline
 
 - The configured development cohort contains 480 P/F cases; the held-out S
   scanner cohort contains 52 separate cases.
-- At the latest audit, only 40/480 development cases had the complete local
-  OOF/coarse/GT-SDF cache needed by the identity tool.
-- A partial 40-case full-path `v=0` diagnostic measured Dice 0.8698, clDice
-  0.9680, HD95 5.671 mm, and score 0.9189.
-- That output has `complete_cv=false` and is **not** a prior floor.
-- One tested SDF sign round-trip changed zero voxels.
+- All 480 development cases passed the OOF provenance and geometry audit.
+- Direct OOF hard mask, direct coarse-SDF sign decode, and zero-velocity
+  sliding-window full-path outputs differed by zero voxels.
+- The complete per-case identity baseline measured Dice 0.910125, clDice
+  0.991210, and HD95 0.829462 mm. Its immutable report SHA256 is
+  `356f7dae6904e2dbe2d3f81ff21e2151d57623dc9f2f7928caeffcc6e1ad83e5`.
 
-The 40-case result is not a trustworthy baseline until direct hard mask, direct
-SDF sign decode, and full sliding-window identity are compared case by case.
+This supersedes the earlier partial 40-case preflight as the measured identity
+reference. It does not set the Dice non-inferiority margin; that remains an
+explicit pre-run user decision.
+
+### 2.4 Prompt-2 limited endpoint diagnostic
+
+The historical training did not retain immutable per-epoch checkpoints, so an
+exact training trajectory is unavailable. The only audited endpoints are:
+
+- `best.pt`, labelled only `best_legacy_unknown_epoch`; its internal epoch is
+  absent. Calling it epoch 0 or epoch 1 is invalid. Whether it is early or
+  prior-like is a hypothesis.
+- `last.pt`, labelled `epoch_129` after its internal epoch value was verified as
+  129.
+
+The diagnostic was produced on an NVIDIA L4 from git
+`7b6a32686fab381a0840d6f512a6ca9647f9593a`, using 12 cases, the same 48-patch
+grid (24 foreground and 24 pure-background patches) for both endpoints, and a
+case-level bootstrap. Its manifest records `protocol_deviation=true`,
+`exact_epoch_trajectory_available=false`, and
+`historical_per_epoch_checkpoints_were_not_saved=true`.
+
+Measured endpoint observations, limited to the sampled cases and strata:
+
+- The legacy best endpoint produced better full-volume segmentation than epoch
+  129 on the five thickening-probe cases (10 sides): mean Dice 0.849671 versus
+  0.732484 and mean HD95 0.581389 versus 6.335279 mm.
+- Epoch 129 nevertheless had lower checkpoint-based FM loss averaged across the
+  diagnostic t-grid and strata (0.000491 versus 0.002787). Low FM loss therefore
+  did not imply better full-volume segmentation in this endpoint comparison.
+- Epoch-129 predictions showed a geometry signal compatible with thickening:
+  mean prediction/GT volume ratio was 1.5926 before erosion, and physical
+  erosion improved Dice and HD95 on 9/10 sides. Mean Dice rose to 0.809608.
+- One epoch-129 outlier, `ToothFairy3F_011` side 1, retained approximately
+  55.3 mm HD95 after erosion. Uniform thickening does not explain that failure.
+- At epoch 129, coarse-prior zero/swap interventions changed the output more
+  than CBCT zero/shuffle interventions. This ordering was not uniform for every
+  intervention at the unknown-epoch legacy best endpoint; CBCT Gaussian-noise
+  sensitivity was also substantial at epoch 129.
+- Direct analytic-shortcut similarity was not close to an exact implementation
+  (mean cosine was 0.139 at epoch 129 and -0.068 at the legacy best endpoint;
+  mean R² was negative). Prior dependence and endpoint behaviour are diagnostic
+  evidence, not mathematical proof that the algebraic shortcut is implemented.
+
+These observations motivate a new, prospectively checkpointed early-epoch
+Fold-0 trajectory pilot. They are diagnostic-only: they are not a paper proof,
+do not identify the legacy best epoch or the epoch where degradation began, and
+do not establish monotonic thickening throughout historical training.
 
 ---
 
@@ -250,7 +299,9 @@ surface-distance, erosion, and radius-profile measurements.
 1. **Learned shortcut use.** The trained velocity model relies on `x_t` and clean
    `x0` while being insensitive to CBCT. Test with CBCT zero/noise/shuffle,
    cross-case coarse-SDF swaps, analytic-shortcut cosine similarity and R²,
-   checkpoint progression, foreground/background strata, and case bootstrap CIs.
+   prospectively saved early-epoch checkpoints, foreground/background strata,
+   and case bootstrap CIs. The historical run cannot supply checkpoint
+   progression; its limited endpoint evidence is mixed and diagnostic-only.
 2. **Small-t profile.** Deterministic small-t loss may plateau because `x_t`
    contains little target information; noised shortcut error may grow like
    `sigma²/t²`. A low large-t loss alone is not evidence of shortcut use because
@@ -376,8 +427,11 @@ tests across model, dataset, validation, and sliding-window inference.
   atomic Drive write, interruption, and resume.
 - Every case is independently validated and persisted. Completed valid artifacts
   are skipped on restart; failures and retries remain visible.
-- Do not run Prompt 2–6, B0–B4, or any 3-D bridge training until Prompt 1 is
-  complete and its explicit user decisions are set.
+- Prompt 1 is complete, but the non-inferiority margin remains an explicit user
+  decision. The legacy Prompt-3 B0–B3 50-epoch grid is temporarily superseded:
+  do not launch it, Prompt 4–6, or any 3-D bridge training until Prompt 3R code
+  and the prospectively checkpointed short Fold-0 pilot pass their declared
+  acceptance criteria.
 
 ---
 

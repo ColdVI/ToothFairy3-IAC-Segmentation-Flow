@@ -230,6 +230,83 @@ Hiçbir training kodunu değiştirme.
 
 ---
 
+## Prompt 3R — Limited Endpoint Probe Sonrası Flow-v2 Pilotu
+
+```
+Bu görev Prompt 0, Prompt 1 ve limited-endpoint Prompt 2 sonrasındaki Aşama
+1A'dır. Eski Prompt 3'ü silmez; Prompt 3R acceptance geçene kadar erteler.
+Prompt 4, Prompt 5 ve Prompt 6 da bu gate geçmeden başlatılamaz.
+
+KESİN STOP KURALLARI:
+- B0-B3 dört adet 50-epoch run'ı başlatma.
+- Legacy checkpoint üretme, migrate etme, yeniden kaydetme veya overwrite etme.
+- Track A'yı yeniden eğitme.
+- Prompt-1 identity artefaktlarını yalnızca salt-okunur kullan.
+- Limited diagnostic'i paper proof veya gerçek training trajectory diye sunma.
+
+ÖNCE KAYNAK ARTEFAKT AUDITİ:
+Repo ve Drive altında yolları tahmin etmeden şu beş artefaktı bul ve oku:
+shortcut_probe_manifest.json, shortcut_probe_summary.json, shortcut_probe.csv,
+thickening_probe.csv ve limited_endpoint_diagnostic.pdf. Manifest git HEAD,
+dirty flag, resolved config/config hash, checkpoint yolları ve SHA256'ları,
+identity-baseline SHA256, GPU, vaka/patch/strata sayıları ve şu flag'leri mevcut
+çalışma ağacıyla karşılaştır:
+
+  protocol_deviation=true
+  exact_epoch_trajectory_available=false
+  historical_per_epoch_checkpoints_were_not_saved=true
+
+Endpoint sözleşmesi:
+- best.pt = best_legacy_unknown_epoch; internal epoch yoktur. Epoch 0/1 veya
+  başka bir epoch atama. Erken/prior-like olduğu yalnızca hipotezdir.
+- last.pt/latest.pt yalnızca internal epoch 129 doğrulanırsa epoch_129'dur.
+
+ÖLÇÜLMÜŞ / ÖLÇÜLMEMİŞ AYRIMI:
+Ölçülmüş gözlemler olarak yalnızca kaynak artefaktların desteklediği kapsamı
+yaz: legacy best'in örneklenen full-volume vakalarda epoch 129'dan iyi olması;
+epoch 129'un daha düşük FM loss'una rağmen daha kötü segmentation üretmesi;
+epoch 129'da thickening ile uyumlu volume/surface/radius sinyali; fiziksel
+erozyonla birçok tarafta recovery; epoch 129'da güçlü coarse-prior dependence;
+ve basit thickening ile düzelmeyen HD95 outlier'ı.
+
+Ölçülmemiş olarak açıkça koru: best.pt exact epoch'u, bozulmanın başladığı epoch,
+tüm eğitim boyunca monoton thickening, shortcut'ın matematiksel ispatı ve legacy
+best'in başarılı bir flow modeli olduğu iddiası.
+
+KOD ENVANTERİ — DEĞİŞTİRMEDEN ÖNCE:
+Kaynak kod ve testlerden şu maddelerin durumunu implemented / partial / missing
+olarak raporla: zero-init head; best_any/best_safe; complete-CV prior floor ve
+predeclared margin gate; soft-Dice; dynamic conditioning channels;
+topology-aware validation; immutable checkpoint history; paired three-path
+identity comparison. Kod ile belge çelişirse kodu otomatik olarak belgeye
+uydurma; çelişkiyi önce raporla.
+
+DOKÜMANTASYON UZLAŞTIRMASI:
+- CLAUDE.md measured state'e historical per-epoch checkpoint'lerin
+  saklanmadığını, exact trajectory'nin unavailable olduğunu, legacy best
+  epoch'unun unknown olduğunu ve limited diagnostic'in ölçülmüş sonuçlarını ekle.
+- Thickening ve prior dependence'i diagnostic observation olarak; yeni
+  early-epoch trajectory ihtiyacını motivation olarak; shortcut mekanizmasını
+  hypothesis olarak sınıflandır.
+- Eski Prompt 3'ü bu uyarının altında aynen koru ve deferred say.
+
+Bu dokümantasyon gate'i tek commit olmalıdır:
+  stage1a/docs: reconcile Prompt 3 with limited endpoint evidence
+
+SONRAKİ AŞAMA SINIRI:
+Bu metin güvenlik düzeltmeleri veya pilot training için tek başına launch
+authorization değildir. Flow-v2 kod değişiklikleri test-first yapılmalı;
+prospective pilot her epoch'u immutable ve atomik saklamalı, resume ile aynı
+trajectory'yi korumalı ve uzun B0-B3 run'larından önce kısa Fold-0 acceptance
+gate'inden geçmelidir. Pilot bütçesi, validation cadence'i ve acceptance
+eşikleri ayrıca açıkça tanımlanmadan training başlatma.
+```
+
+> **SUPERSEDED TEMPORARILY BY PROMPT 3R**
+>
+> Do not launch B0–B3 50-epoch runs until Prompt 3R code and pilot acceptance
+> criteria pass.
+
 ## Prompt 3 — Aşama 1: ablation grid (GPU: ~4 saat, fold 0, 50'şer epoch)
 
 ```
