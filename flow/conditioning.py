@@ -18,9 +18,17 @@ conditioning `c`, plus the lateral-coordinate channel used by the laterality los
 """
 import numpy as np
 
+try:
+    from .channel_contract import (COND_CH, FLOW_STATE_CH, ConditioningSpec,
+                                   resolve_conditioning_spec,
+                                   validate_conditioning_tensor)
+except ImportError:  # direct script imports from flow/ on sys.path
+    from channel_contract import (COND_CH, FLOW_STATE_CH, ConditioningSpec,
+                                  resolve_conditioning_spec,
+                                  validate_conditioning_tensor)
 
-CHANNELS = ["cbct", "prob_left", "prob_right", "coarse_sdf_left",
-            "coarse_sdf_right", "coord_x", "coord_y", "coord_z"]
+
+CHANNELS = list(resolve_conditioning_spec().conditioning_channel_names)
 
 
 def znorm(vol):
@@ -28,23 +36,23 @@ def znorm(vol):
     return (v - v.mean()) / (v.std() + 1e-6)
 
 
-def build_conditioning(cbct, prob_l, prob_r, coarse_sdf_l, coarse_sdf_r, coords_norm):
+def build_conditioning(cbct, prob_l, prob_r, coarse_sdf_l, coarse_sdf_r, coords_norm,
+                       *, spec: ConditioningSpec | None = None, cfg=None):
     """
     All inputs are numpy arrays of matching (D,H,W) except coords_norm (3,D,H,W).
     Returns (8, D, H, W) float32. CBCT is z-normalised here; the SDFs and probs
     are assumed already normalised by the caller.
     """
-    stack = np.stack([
-        znorm(cbct),
-        prob_l.astype(np.float32),
-        prob_r.astype(np.float32),
-        coarse_sdf_l.astype(np.float32),
-        coarse_sdf_r.astype(np.float32),
-        coords_norm[0].astype(np.float32),
-        coords_norm[1].astype(np.float32),
-        coords_norm[2].astype(np.float32),
-    ], axis=0)
-    return stack.astype(np.float32)
+    spec = spec or resolve_conditioning_spec(cfg)
+    channels = [znorm(cbct), prob_l.astype(np.float32), prob_r.astype(np.float32)]
+    if spec.include_coarse_sdf:
+        channels.extend((coarse_sdf_l.astype(np.float32),
+                         coarse_sdf_r.astype(np.float32)))
+    channels.extend(coords_norm[index].astype(np.float32) for index in range(3))
+    stack = np.stack(channels, axis=0).astype(np.float32)
+    validate_conditioning_tensor(stack, spec, channel_axis=0,
+                                 context="built conditioning")
+    return stack
 
 
 def lateral_axis_index(affine):

@@ -41,6 +41,8 @@ from data.io_utils import (normalize_coords, physical_coord_grid,  # noqa: E402
                            sdf_stack_to_mask, voxel_spacing)
 from evaluation.metrics import _surface_distances, dice, hd95  # noqa: E402
 from flow.conditioning import build_conditioning  # noqa: E402
+from flow.channel_contract import (resolve_conditioning_spec,                # noqa: E402
+                                   validate_checkpoint_contract)
 from flow.model import COND_CH, FLOW_STATE_CH, ResidualVelocityUNet3D  # noqa: E402
 from flow.sliding_window import predict_volume  # noqa: E402
 
@@ -282,8 +284,14 @@ def _resolved_model_contract(checkpoint):
     head = state["head.2.weight"]
     base, total_in = int(stem.shape[0]), int(stem.shape[1])
     state_ch = int(head.shape[0]); cond_ch = total_in - state_ch
-    if state_ch != FLOW_STATE_CH or cond_ch != COND_CH:
+    spec = resolve_conditioning_spec({"cond_include_coarse_sdf": cond_ch == COND_CH})
+    if state_ch != spec.state_channels or cond_ch != spec.conditioning_channels:
         raise ReadinessError(f"channel contract mismatch: state={state_ch}, cond={cond_ch}")
+    try:
+        validate_checkpoint_contract(
+            checkpoint, spec, legacy_compatibility="channel_contract" not in checkpoint)
+    except ValueError as error:
+        raise ReadinessError(str(error)) from error
     model = ResidualVelocityUNet3D(cond_ch=cond_ch, state_ch=state_ch, base=base)
     try:
         model.load_state_dict(state, strict=True)
@@ -291,7 +299,8 @@ def _resolved_model_contract(checkpoint):
         raise ReadinessError(f"model state is incompatible: {error}") from error
     contract = {"base": base, "state_ch": state_ch, "cond_ch": cond_ch,
                 "patch": int(cfg.get("patch", 96)), "ode_steps": int(cfg.get("ode_steps", 8)),
-                "config": cfg, "config_hash": canonical_hash(cfg)}
+                "config": cfg, "config_hash": canonical_hash(cfg),
+                "channel_contract": spec.to_dict()}
     return model, contract
 
 

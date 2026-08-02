@@ -21,12 +21,13 @@ from torch.utils.data import Dataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
 from io_utils import physical_coord_grid, normalize_coords            # noqa: E402
-from conditioning import build_conditioning                           # noqa: E402
+from conditioning import build_conditioning, resolve_conditioning_spec  # noqa: E402
 
 
 class IACFlowDataset(Dataset):
     def __init__(self, case_ids, images_dir, gt_sdf_dir, coarse_sdf_dir,
-                 patch=96, fg_prob=0.8, cache=8):
+                 patch=96, fg_prob=0.8, cache=8, conditioning_spec=None,
+                 cfg=None):
         self.ids = list(case_ids)
         self.images_dir = images_dir
         self.gt_sdf_dir = gt_sdf_dir
@@ -34,6 +35,7 @@ class IACFlowDataset(Dataset):
         self.patch = patch
         self.fg_prob = fg_prob
         self.cache = cache
+        self.conditioning_spec = conditioning_spec or resolve_conditioning_spec(cfg)
         self._mem = {}
 
     def __len__(self):
@@ -50,7 +52,9 @@ class IACFlowDataset(Dataset):
         coarse_sdf = co["sdf"].astype(np.float32)
         prob_l = co["prob_left"].astype(np.float32)
         prob_r = co["prob_right"].astype(np.float32)
-        cond = build_conditioning(cbct, prob_l, prob_r, coarse_sdf[0], coarse_sdf[1], coords)
+        cond = build_conditioning(
+            cbct, prob_l, prob_r, coarse_sdf[0], coarse_sdf[1], coords,
+            spec=self.conditioning_spec)
         item = (cond, coarse_sdf, gt)
         if len(self._mem) >= self.cache:
             self._mem.pop(next(iter(self._mem)))

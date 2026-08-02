@@ -66,7 +66,8 @@ def atomic_write_json(path, payload):
     os.replace(partial, path)
 
 
-def start_manifest(out_dir, config, fold, seed, repo_root, resume=False):
+def start_manifest(out_dir, config, fold, seed, repo_root, resume=False,
+                   channel_contract=None):
     out_dir = Path(out_dir)
     manifest_path = out_dir / "manifest.json"
     sha, dirty = _git_info(repo_root)
@@ -78,6 +79,7 @@ def start_manifest(out_dir, config, fold, seed, repo_root, resume=False):
         "git_commit": sha,
         "git_dirty": dirty,
         "resolved_config": config,
+        "channel_contract": channel_contract,
         "config_sha256": hashlib.sha256(_canonical_json(config).encode()).hexdigest(),
         "config_hash": digest,
         "fold": int(fold),

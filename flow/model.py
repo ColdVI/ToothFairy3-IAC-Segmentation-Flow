@@ -18,8 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-FLOW_STATE_CH = 2      # Left SDF, Right SDF
-COND_CH = 8            # CBCT, prob_L, prob_R, coarse_SDF_L, coarse_SDF_R, x, y, z
+try:
+    from .channel_contract import COND_CH, FLOW_STATE_CH
+except ImportError:  # direct script imports from flow/ on sys.path
+    from channel_contract import COND_CH, FLOW_STATE_CH
 
 
 class SinusoidalTime(nn.Module):

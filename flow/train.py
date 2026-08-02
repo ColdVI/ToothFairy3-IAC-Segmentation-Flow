@@ -25,12 +25,14 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from model import ResidualVelocityUNet3D, COND_CH        # noqa: E402
+from model import ResidualVelocityUNet3D                 # noqa: E402
 from losses import total_loss                            # noqa: E402
 from datasets import IACFlowDataset                      # noqa: E402
 from validate import validate                            # noqa: E402
 from scripts.run_manifest import (default_run_dir, finish_manifest,             # noqa: E402
                                   start_manifest)
+from channel_contract import (resolve_conditioning_spec,                        # noqa: E402
+                              validate_checkpoint_contract)
 
 
 PRIOR_METRICS = ("dice", "cldice", "hd95", "score")
@@ -223,6 +225,7 @@ def main():
     a = ap.parse_args()
 
     cfg = load_yaml(a.config)
+    conditioning_spec = resolve_conditioning_spec(cfg)
     prior_floor = require_prior_floor(cfg)
     noninferiority_margin = require_noninferiority_margin(cfg)
     seed = int(cfg.get("seed", 0) if a.seed is None else a.seed)
@@ -238,7 +241,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     start_manifest(a.out, cfg, a.fold, seed,
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
-                   resume=a.resume)
+                   resume=a.resume, channel_contract=conditioning_spec.to_dict())
     manifest_finished = False
 
     def mark_interrupted():
@@ -249,11 +252,16 @@ def main():
     print(f"[train] fold {a.fold}: {len(train_ids)} train / {len(val_ids)} val  device={dev}")
 
     ds = IACFlowDataset(train_ids, a.images, a.gt_sdf, a.coarse_sdf,
-                        patch=cfg.get("patch", 96), fg_prob=cfg.get("fg_prob", 0.8))
+                        patch=cfg.get("patch", 96), fg_prob=cfg.get("fg_prob", 0.8),
+                        conditioning_spec=conditioning_spec)
     dl = DataLoader(ds, batch_size=cfg.get("batch_size", 2), shuffle=True,
                     num_workers=cfg.get("num_workers", 4), drop_last=True)
 
-    model = ResidualVelocityUNet3D(cond_ch=COND_CH, base=cfg.get("base", 32)).to(dev)
+    model = ResidualVelocityUNet3D(
+        cond_ch=conditioning_spec.conditioning_channels,
+        state_ch=conditioning_spec.state_channels,
+        base=cfg.get("base", 32),
+        zero_init_head=cfg.get("zero_init_head", False)).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.get("lr", 1e-4),
                             weight_decay=cfg.get("weight_decay", 1e-5))
     epochs = cfg.get("epochs", 500)
@@ -272,13 +280,16 @@ def main():
           f"Dice={prior_floor['dice']:.4f} clDice={prior_floor['cldice']:.4f} "
           f"HD95={prior_floor['hd95']:.3f} mm")
     print(f"[train] Dice non-inferiority margin: {noninferiority_margin:.6f}")
-    if a.resume:
+    if a.resume and cfg.get("legacy_compatibility", False):
         migrated_any, _ = migrate_legacy_best(a.out, map_location=dev)
         if migrated_any is not None:
             print("[resume] preserved legacy best.pt as best_any.pt; it is not safe-eligible "
                   "because legacy topology ranks are unavailable")
     if a.resume and os.path.isfile(last_path):
         ck = torch.load(last_path, map_location=dev, weights_only=False)
+        validate_checkpoint_contract(
+            ck, conditioning_spec,
+            legacy_compatibility=cfg.get("legacy_compatibility", False))
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
@@ -327,14 +338,16 @@ def main():
         if is_val:
             m = validate(model, val_ids, a.images, a.coarse_sdf, a.labels,
                          patch=cfg.get("patch", 96), steps=cfg.get("ode_steps", 8),
-                         device=dev, max_cases=cfg.get("val_max_cases", 20))
+                         device=dev, max_cases=cfg.get("val_max_cases", 20),
+                         conditioning_spec=conditioning_spec)
             best_any, best_safe, write_any, write_safe = update_checkpoint_selection(
                 m, ep, best_any, best_safe, prior_floor, noninferiority_margin)
             checkpoint = {"model": model.state_dict(), "cfg": cfg,
                           "val": {**m, "epoch": ep,
                                   "safe_eligible": is_safe(
                                       m, prior_floor, noninferiority_margin)},
-                          "fold": a.fold, "seed": seed}
+                          "fold": a.fold, "seed": seed,
+                          "channel_contract": conditioning_spec.to_dict()}
             if write_any:
                 atomic_torch_save(checkpoint, best_any_path)
             if write_safe:
@@ -372,7 +385,8 @@ def main():
             atomic_torch_save({"model": model.state_dict(), "opt": opt.state_dict(),
                                "sched": sched.state_dict(), "epoch": ep,
                                "best_any": best_any, "best_safe": best_safe,
-                               "cfg": cfg, "fold": a.fold, "seed": seed}, last_path)
+                               "cfg": cfg, "fold": a.fold, "seed": seed,
+                               "channel_contract": conditioning_spec.to_dict()}, last_path)
     print("[train] done. best_any:", best_any, "->",
           best_any_path if os.path.isfile(best_any_path) else "none")
     print("[train] done. best_safe:", best_safe, "->",

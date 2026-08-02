@@ -11,7 +11,12 @@ spatially coherent across seams.
 import numpy as np
 import torch
 
-from sampler import integrate, make_x0
+try:
+    from .sampler import integrate, make_x0
+    from .channel_contract import ConditioningContractError
+except ImportError:  # direct script imports from flow/ on sys.path
+    from sampler import integrate, make_x0
+    from channel_contract import ConditioningContractError
 
 
 def _gaussian_weight(patch, sigma_scale=0.125):
@@ -47,6 +52,11 @@ def predict_volume(model, cond_vol, coarse_sdf_vol, patch=96, overlap=0.5,
     stochastic uncertainty mode.
     """
     C, D, H, W = cond_vol.shape
+    expected_cond = getattr(model, "cond_ch", None)
+    if expected_cond is not None and C != int(expected_cond):
+        raise ConditioningContractError(
+            f"sliding-window conditioning channel mismatch: model expects "
+            f"{expected_cond}, volume has {C}")
     step = max(1, int(patch * (1 - overlap)))
     acc = np.zeros((2, D, H, W), np.float32)
     wsum = np.zeros((D, H, W), np.float32)
