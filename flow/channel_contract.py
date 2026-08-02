@@ -7,11 +7,11 @@ from dataclasses import asdict, dataclass
 
 STATE_CHANNEL_NAMES = ("sdf_left", "sdf_right")
 LEGACY_CONDITIONING_CHANNEL_NAMES = (
-    "cbct", "hard_left", "hard_right", "coarse_sdf_left", "coarse_sdf_right",
+    "cbct", "prob_left", "prob_right", "coarse_sdf_left", "coarse_sdf_right",
     "coord_x", "coord_y", "coord_z",
 )
 PROMPT3R_CONDITIONING_CHANNEL_NAMES = (
-    "cbct", "hard_left", "hard_right", "coord_x", "coord_y", "coord_z",
+    "cbct", "prob_left", "prob_right", "coord_x", "coord_y", "coord_z",
 )
 
 

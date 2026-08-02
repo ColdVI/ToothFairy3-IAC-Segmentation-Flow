@@ -26,9 +26,9 @@ def _inputs(shape=(4, 5, 6)):
 
 
 @pytest.mark.parametrize("include,expected_names", [
-    (True, ["cbct", "hard_left", "hard_right", "coarse_sdf_left",
+    (True, ["cbct", "prob_left", "prob_right", "coarse_sdf_left",
             "coarse_sdf_right", "coord_x", "coord_y", "coord_z"]),
-    (False, ["cbct", "hard_left", "hard_right", "coord_x", "coord_y", "coord_z"]),
+    (False, ["cbct", "prob_left", "prob_right", "coord_x", "coord_y", "coord_z"]),
 ])
 def test_conditioning_contract_order_shape_and_cbct_channel(include, expected_names):
     spec = resolve_conditioning_spec({"cond_include_coarse_sdf": include})
