@@ -32,7 +32,8 @@ from flow.channel_contract import (resolve_conditioning_spec,  # noqa: E402
 from flow.checkpointing import (CheckpointConflictError, atomic_write_trajectory,
                                 build_checkpoint_payload, cleanup_checkpoint_partials,
                                 save_immutable_checkpoint, save_resume_checkpoint,
-                                sha256_file, upsert_epoch_record)
+                                sha256_file, upsert_epoch_record,
+                                verify_immutable_checkpoint)
 from flow.datasets import IACFlowDataset  # noqa: E402
 from flow.losses import compute_prompt3r_training_loss  # noqa: E402
 from flow.model import ResidualVelocityUNet3D  # noqa: E402
@@ -137,6 +138,8 @@ def _load_resume_state(out_dir, spec, run_id, resolved_hash, selection_policy):
     if not candidates:
         return None
     epoch, path = max(candidates, key=lambda item: item[0])
+    if path.name.startswith("epoch_"):
+        verify_immutable_checkpoint(path)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     validate_checkpoint_contract(checkpoint, spec, legacy_compatibility=False)
     expected = {"run_id": run_id, "config_hash": resolved_hash,

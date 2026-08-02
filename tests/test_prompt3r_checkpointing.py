@@ -18,6 +18,7 @@ from flow.checkpointing import (
     save_resume_checkpoint,
     sha256_file,
     upsert_epoch_record,
+    verify_immutable_checkpoint,
 )
 
 
@@ -49,6 +50,15 @@ def test_immutable_save_verifies_and_skips_exact_resume(tmp_path):
     assert first["created"] is True and second["created"] is False
     assert first["sha256"] == second["sha256"] == sha256_file(first["path"])
     assert Path(first["path"]).read_bytes() == original
+    assert verify_immutable_checkpoint(first["path"]) == first["sha256"]
+
+
+def test_tampered_immutable_checksum_receipt_is_rejected(tmp_path):
+    payload, spec = _payload()
+    saved = save_immutable_checkpoint(tmp_path, payload, spec)
+    Path(saved["path"] + ".sha256").write_text("0" * 64 + "\n")
+    with pytest.raises(CheckpointConflictError, match="checksum mismatch"):
+        verify_immutable_checkpoint(saved["path"])
 
 
 def test_existing_epoch_with_other_run_id_is_rejected_without_overwrite(tmp_path):

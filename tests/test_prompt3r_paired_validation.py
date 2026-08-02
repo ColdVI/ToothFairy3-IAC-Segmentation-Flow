@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from evaluation.geometry_metrics import side_geometry_metrics
-from flow.pilot_cases import build_pilot_case_manifest, select_pilot_cases
+from flow.pilot_cases import (build_pilot_case_manifest, select_pilot_cases,
+                              write_manifest_no_overwrite)
 from flow.validate import (CORE_METRICS, GEOMETRY_METRICS, paired_case_rows,
                            paired_identity_safety_gate)
 
@@ -34,6 +35,8 @@ def _paired_row(case_id, side, *, valid=True, dice_delta=-0.001,
         row[f"identity_{name}"] = identity[name]
         row[f"flow_{name}"] = flow[name]
         row[f"delta_{name}"] = flow[name] - identity[name]
+    row["delta_abs_volume_bias"] = (abs(flow["volume_ratio"] - 1)
+                                     - abs(identity["volume_ratio"] - 1))
     return row
 
 
@@ -96,3 +99,12 @@ def test_pilot_panel_is_deterministic_stratified_and_matches_committed_file():
     committed = json.load(open("configs/prompt3r_pilot_cases.json"))
     generated = build_pilot_case_manifest("configs/splits.json")
     assert committed == generated
+
+
+def test_pilot_panel_refuses_overwrite_but_allows_exact_resume(tmp_path):
+    path = tmp_path / "panel.json"
+    manifest = {"source_splits_sha256": "a", "quick_case_ids": ["f", "p"]}
+    assert write_manifest_no_overwrite(path, manifest) is True
+    assert write_manifest_no_overwrite(path, manifest) is False
+    with pytest.raises(FileExistsError):
+        write_manifest_no_overwrite(path, {**manifest, "quick_case_ids": ["other"]})

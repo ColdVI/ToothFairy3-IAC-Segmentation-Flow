@@ -136,6 +136,10 @@ def paired_validation_rows(model, val_ids, images_dir, coarse_sdf_dir,
                 left, right = identity[name], flow[name]
                 row[f"delta_{name}"] = (None if left is None or right is None
                                          else float(right) - float(left))
+            row["delta_abs_volume_bias"] = (
+                None if identity["volume_ratio"] is None or flow["volume_ratio"] is None
+                else abs(float(flow["volume_ratio"]) - 1.0)
+                - abs(float(identity["volume_ratio"]) - 1.0))
             reasons = []
             if not identity["geometry_valid"]:
                 reasons.append(f"identity:{identity['geometry_reason']}")

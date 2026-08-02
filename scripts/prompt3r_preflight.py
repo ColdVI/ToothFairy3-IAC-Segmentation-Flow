@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from flow.prompt3r_config import resolve_prompt3r_config
-from scripts.run_manifest import atomic_write_json
+from scripts.run_manifest import atomic_write_json, config_hash
 
 
 PROMPT2_FILES = (
@@ -79,11 +79,15 @@ def audit_prompt2(directory, identity_sha):
     identity = manifest.get("identity_baseline", {})
     if identity.get("sha256") != identity_sha:
         raise RuntimeError("Prompt-2 and current Prompt-1 identity SHA differ")
+    summary = json.loads((directory / "shortcut_probe_summary.json").read_text())
+    patch_grid = manifest.get("patch_grid", [])
     return {"directory": str(directory), "manifest": manifest_path.as_posix(),
             "manifest_git": manifest.get("git"),
             "config_hash": manifest.get("config_hash"),
             "checkpoints": manifest.get("checkpoints"),
             "gpu": manifest.get("gpu"), "artifacts": hashes,
+            "case_counts": summary.get("counts"),
+            "patch_grid_case_count": len({item.get("case_id") for item in patch_grid}),
             "protocol_flags": required_flags}
 
 
@@ -115,6 +119,7 @@ def run(args):
         "prompt2": prompt2,
         "paths": {"images": str(roots[0]), "labels": str(roots[1]),
                   "gt_sdf": str(roots[2]), "coarse_sdf": str(roots[3])},
+        "resolved_config_hash": config_hash(resolved, 0, int(resolved.get("seed", 0))),
         "resolved_prior_floor": resolved["prior_floor"],
     }
     atomic_write_json(args.out, receipt)

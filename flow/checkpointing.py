@@ -98,6 +98,14 @@ def _verify_or_create_receipt(path):
     return actual
 
 
+def verify_immutable_checkpoint(path):
+    """Public checksum verification used before an immutable resume load."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return _verify_or_create_receipt(path)
+
+
 def save_immutable_checkpoint(directory, payload, channel_spec):
     """Publish once; an exact resume encounter verifies and skips the epoch."""
     directory = Path(directory)
