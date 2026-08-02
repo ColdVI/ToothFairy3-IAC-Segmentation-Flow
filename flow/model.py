@@ -52,7 +52,8 @@ class ResBlock3D(nn.Module):
 
 
 class ResidualVelocityUNet3D(nn.Module):
-    def __init__(self, cond_ch=COND_CH, state_ch=FLOW_STATE_CH, base=32, tdim=128):
+    def __init__(self, cond_ch=COND_CH, state_ch=FLOW_STATE_CH, base=32, tdim=128,
+                 zero_init_head=False):
         super().__init__()
         self.state_ch = state_ch
         self.cond_ch = cond_ch
@@ -69,6 +70,10 @@ class ResidualVelocityUNet3D(nn.Module):
         self.d1 = ResBlock3D(base * 2 + base, base, tdim)
         self.head = nn.Sequential(nn.GroupNorm(min(8, base), base), nn.SiLU(),
                                   nn.Conv3d(base, state_ch, 1))
+        self.zero_init_head = bool(zero_init_head)
+        if self.zero_init_head:
+            nn.init.zeros_(self.head[-1].weight)
+            nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, xt, t, cond):
         """xt: (B,state,D,H,W); t: (B,); cond: (B,cond_ch,D,H,W)."""
