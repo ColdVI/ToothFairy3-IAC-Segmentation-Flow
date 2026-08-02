@@ -20,8 +20,9 @@ from torch.utils.data import Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
-from io_utils import physical_coord_grid, normalize_coords            # noqa: E402
+from io_utils import physical_coord_grid, normalize_coords, voxel_spacing  # noqa: E402
 from conditioning import build_conditioning, resolve_conditioning_spec  # noqa: E402
+from prior_perturbation import perturb_training_sample  # noqa: E402
 
 
 class IACFlowDataset(Dataset):
@@ -36,6 +37,9 @@ class IACFlowDataset(Dataset):
         self.fg_prob = fg_prob
         self.cache = cache
         self.conditioning_spec = conditioning_spec or resolve_conditioning_spec(cfg)
+        self.cfg = cfg or {}
+        self.prior_perturbation = self.cfg.get("prior_perturbation", {})
+        self.sdf_clip_mm = float(self.cfg.get("sdf_clip_mm", 10.0))
         self._mem = {}
 
     def __len__(self):
@@ -48,14 +52,15 @@ class IACFlowDataset(Dataset):
         cbct = np.asanyarray(img.dataobj).astype(np.float32)
         coords = normalize_coords(physical_coord_grid(cbct.shape, img.affine))
         gt = np.load(os.path.join(self.gt_sdf_dir, f"{sid}.npz"))["sdf"].astype(np.float32)
-        co = np.load(os.path.join(self.coarse_sdf_dir, f"{sid}.npz"))
-        coarse_sdf = co["sdf"].astype(np.float32)
-        prob_l = co["prob_left"].astype(np.float32)
-        prob_r = co["prob_right"].astype(np.float32)
+        with np.load(os.path.join(self.coarse_sdf_dir, f"{sid}.npz")) as co:
+            coarse_sdf = co["sdf"].astype(np.float32)
+            prob_l = co["prob_left"].astype(np.float32)
+            prob_r = co["prob_right"].astype(np.float32)
+            clip_mm = float(co["clip_mm"]) if "clip_mm" in co else self.sdf_clip_mm
         cond = build_conditioning(
             cbct, prob_l, prob_r, coarse_sdf[0], coarse_sdf[1], coords,
             spec=self.conditioning_spec)
-        item = (cond, coarse_sdf, gt)
+        item = (cond, coarse_sdf, gt, img.affine.copy(), voxel_spacing(img), clip_mm)
         if len(self._mem) >= self.cache:
             self._mem.pop(next(iter(self._mem)))
         self._mem[sid] = item
@@ -82,8 +87,13 @@ class IACFlowDataset(Dataset):
         return c, x0, x1
 
     def __getitem__(self, i):
-        cond, coarse, gt = self._load(self.ids[i % len(self.ids)])
-        c, x0, x1 = self._sample_patch(cond, coarse, gt)
+        cond, coarse, gt, affine, _spacing, clip_mm = self._load(self.ids[i % len(self.ids)])
+        cond, perturbed, gt, _record = perturb_training_sample(
+            cond, coarse, gt, affine, self.conditioning_spec,
+            self.prior_perturbation, np.random.default_rng(
+                np.random.randint(0, np.iinfo(np.uint32).max)),
+            sdf_clip_mm=clip_mm)
+        c, x0, x1 = self._sample_patch(cond, perturbed, gt)
         return (torch.from_numpy(c).float(),
                 torch.from_numpy(x0).float(),
                 torch.from_numpy(x1).float())

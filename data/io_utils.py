@@ -123,6 +123,20 @@ def normalize_sdf(sdf_mm: np.ndarray, clip_mm: float = 10.0) -> np.ndarray:
     return (np.clip(sdf_mm, -clip_mm, clip_mm) / clip_mm).astype(np.float32)
 
 
+def denormalize_sdf(sdf_normalized: np.ndarray, clip_mm: float = 10.0) -> np.ndarray:
+    """Map the canonical normalised SDF representation back to millimetres."""
+    if clip_mm <= 0:
+        raise ValueError("clip_mm must be positive")
+    return (np.asarray(sdf_normalized, dtype=np.float32) * float(clip_mm)).astype(np.float32)
+
+
+def sdf_mm_delta_to_normalized(delta_mm, clip_mm: float = 10.0):
+    """Convert an SDF displacement in mm using the canonical SDF scale."""
+    if clip_mm <= 0:
+        raise ValueError("clip_mm must be positive")
+    return np.asarray(delta_mm, dtype=np.float32) / float(clip_mm)
+
+
 def sdf_stack_to_mask(sdf_lr: np.ndarray, thresh: float = 0.0) -> np.ndarray:
     """
     Decode a 2-channel (Left, Right) SDF stack into a {0,1,2} label map.
