@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from model import ResidualVelocityUNet3D                 # noqa: E402
-from losses import total_loss                            # noqa: E402
+from losses import compute_prompt3r_training_loss, total_loss  # noqa: E402
 from datasets import IACFlowDataset                      # noqa: E402
 from validate import validate                            # noqa: E402
 from scripts.run_manifest import (default_run_dir, finish_manifest,             # noqa: E402
@@ -53,7 +53,9 @@ def save_progress(out_dir, history):
     stdout so a disconnected Colab run still leaves a visual training curve.
     """
     import csv
-    preferred = ["epoch", "trainloss", "fm", "narrowband", "cldice_loss",
+    preferred = ["epoch", "trainloss", "fm_random_t", "t0_sdf",
+                 "t0_narrowband", "t0_softdice", "t0_cldice",
+                 "fm", "narrowband", "cldice_loss",
                  "laterality", "tv", "total", "dice", "cldice", "hd95",
                  "gap_mm", "betti0", "safe_eligible", "score"]
     present = {key for row in history for key in row}
@@ -91,6 +93,11 @@ def save_progress(out_dir, history):
         "laterality": ("#CC79A7", "laterality"),
         "tv": ("#56B4E9", "TV"),
         "total": ("#000000", "total"),
+        "fm_random_t": ("#0072B2", "FM random-t"),
+        "t0_sdf": ("#D55E00", "t0 SDF"),
+        "t0_narrowband": ("#E69F00", "t0 narrow-band"),
+        "t0_softdice": ("#009E73", "t0 soft-Dice"),
+        "t0_cldice": ("#CC79A7", "t0 soft-clDice"),
     }
     for key, (colour, label) in loss_styles.items():
         if any(key in h for h in history):
@@ -307,18 +314,27 @@ def main():
 
     for ep in range(start_epoch, epochs):
         model.train(); t0 = time.time(); run = 0.0; nb = 0
-        component_sums = {key: 0.0 for key in
-                          ("fm", "narrowband", "cldice", "laterality", "tv", "total")}
+        prompt3r_objective = cfg.get("training_objective") == "prompt3r_t0"
+        component_keys = (("fm_random_t", "t0_sdf", "t0_narrowband",
+                           "t0_softdice", "t0_cldice", "total")
+                          if prompt3r_objective else
+                          ("fm", "narrowband", "cldice", "laterality", "tv", "total"))
+        component_sums = {key: 0.0 for key in component_keys}
         for cond, x0, x1 in dl:
             cond, x0, x1 = cond.to(dev), x0.to(dev), x1.to(dev)
-            # noise schedule: some batches deterministic (sigma=0) so inference matches
-            sigma = cfg.get("train_sigma", 0.1) * (np.random.rand() < cfg.get("noise_frac", 0.5))
-            x0n = x0 + sigma * torch.randn_like(x0)
-            t = torch.rand(x1.shape[0], device=dev)
-            tb = t.view(-1, 1, 1, 1, 1)
-            xt = (1 - tb) * x0n + tb * x1
-            pred_v = model(xt, t, cond)
-            loss, comp = total_loss(pred_v, x0n, x1, t, cfg)
+            if prompt3r_objective:
+                loss, comp = compute_prompt3r_training_loss(
+                    model, cond, x0, x1, cfg)
+            else:
+                # Legacy schedule remains available only outside the Prompt-3R objective.
+                sigma = cfg.get("train_sigma", 0.1) * (
+                    np.random.rand() < cfg.get("noise_frac", 0.5))
+                x0n = x0 + sigma * torch.randn_like(x0)
+                t = torch.rand(x1.shape[0], device=dev)
+                tb = t.view(-1, 1, 1, 1, 1)
+                xt = (1 - tb) * x0n + tb * x1
+                pred_v = model(xt, t, cond)
+                loss, comp = total_loss(pred_v, x0n, x1, t, cfg)
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); run += comp["total"]; nb += 1
@@ -364,13 +380,11 @@ def main():
                   f"wall {wall_elapsed / 60:.1f} min | ETA {eta / 60:.1f} min", flush=True)
             component_means = {key: value / max(1, nb)
                                for key, value in component_sums.items()}
+            logged_components = dict(component_means)
+            if not prompt3r_objective:
+                logged_components["cldice_loss"] = logged_components.pop("cldice")
             history.append({"epoch": ep, "trainloss": run / max(1, nb),
-                            "fm": component_means["fm"],
-                            "narrowband": component_means["narrowband"],
-                            "cldice_loss": component_means["cldice"],
-                            "laterality": component_means["laterality"],
-                            "tv": component_means["tv"],
-                            "total": component_means["total"],
+                            **logged_components,
                             "dice": m["dice"], "cldice": m["cldice"],
                             "hd95": m["hd95"], "gap_mm": m["gap_mm"],
                             "betti0": m["betti0"],

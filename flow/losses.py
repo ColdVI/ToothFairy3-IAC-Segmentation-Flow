@@ -96,6 +96,93 @@ def soft_cldice_loss(occ_pred, occ_true, iters: int = 10, eps: float = 1e-6):
     return 1.0 - cldice
 
 
+def soft_dice_loss(occ_pred, occ_true, eps: float = 1e-6):
+    """Differentiable overlap loss, averaged over batch and anatomical channel."""
+    dims = tuple(range(2, occ_pred.ndim))
+    intersection = (occ_pred * occ_true).sum(dim=dims)
+    denominator = occ_pred.sum(dim=dims) + occ_true.sum(dim=dims)
+    score = (2.0 * intersection + eps) / (denominator + eps)
+    return 1.0 - score.mean()
+
+
+def sample_mixed_low_t(batch_size, cfg, device, *, generator=None):
+    """Draw disjoint low-t and ordinary-uniform groups deterministically by seed."""
+    fraction = float(cfg.get("low_t_fraction", 0.0))
+    low_max = float(cfg.get("low_t_max", 0.25))
+    if not 0 <= fraction <= 1 or not 0 < low_max <= 1:
+        raise ValueError("invalid mixed-low-t sampling configuration")
+    count = int(round(int(batch_size) * fraction))
+    low_group = torch.zeros(int(batch_size), dtype=torch.bool, device=device)
+    if count:
+        selected = torch.randperm(int(batch_size), device=device, generator=generator)[:count]
+        low_group[selected] = True
+    times = torch.rand(int(batch_size), device=device, generator=generator)
+    if count:
+        times[low_group] = torch.rand(count, device=device, generator=generator) * low_max
+    return times, low_group
+
+
+def predict_t0_endpoint(model, state0, conditioning):
+    """Predict the actual inference endpoint without accepting GT as an input."""
+    t0 = torch.zeros(state0.shape[0], dtype=state0.dtype, device=state0.device)
+    return state0 + model(state0, t0, conditioning)
+
+
+def _two_channel_endpoint_losses(endpoint, target, cfg):
+    tau = float(cfg.get("occ_tau", 0.05))
+    iters = int(cfg.get("cldice_iters", 10))
+    sdf = F.mse_loss(endpoint, target)
+    narrowband = narrow_band_loss(
+        endpoint, target, float(cfg.get("narrowband_band", 0.2)))
+    dice_terms, cldice_terms = [], []
+    for channel in range(endpoint.shape[1]):
+        predicted = sdf_to_occupancy(endpoint[:, channel:channel + 1], tau)
+        truth = sdf_to_occupancy(target[:, channel:channel + 1], tau)
+        dice_terms.append(soft_dice_loss(predicted, truth))
+        cldice_terms.append(soft_cldice_loss(predicted, truth, iters))
+    return {
+        "t0_sdf": sdf,
+        "t0_narrowband": narrowband,
+        "t0_softdice": torch.stack(dice_terms).mean(),
+        "t0_cldice": torch.stack(cldice_terms).mean(),
+    }
+
+
+def compute_prompt3r_training_loss(model, conditioning, state0, target, cfg,
+                                   *, generator=None):
+    """Mixed-t FM plus a separate, GT-free-input t=0 endpoint branch."""
+    times, _ = sample_mixed_low_t(
+        target.shape[0], cfg, target.device, generator=generator)
+    tb = times.view(-1, 1, 1, 1, 1)
+    state_t = (1 - tb) * state0 + tb * target
+    predicted_velocity = model(state_t, times, conditioning)
+    if cfg.get("random_t_aux_enabled", False):
+        random_loss, _ = total_loss(
+            predicted_velocity, state0, target, times, cfg)
+    else:
+        random_loss = flow_matching_loss(predicted_velocity, state0, target)
+    components = {"fm_random_t": float(random_loss.detach())}
+    endpoint_weight = float(cfg.get("w_t0_endpoint", 0.0))
+    if endpoint_weight == 0:
+        components.update({name: 0.0 for name in
+                           ("t0_sdf", "t0_narrowband", "t0_softdice", "t0_cldice")})
+        components["total"] = float(random_loss.detach())
+        return random_loss, components
+
+    endpoint = predict_t0_endpoint(model, state0, conditioning)
+    losses = _two_channel_endpoint_losses(endpoint, target, cfg)
+    t0_loss = (
+        float(cfg.get("w_t0_sdf", 1.0)) * losses["t0_sdf"]
+        + float(cfg.get("w_t0_narrowband", 1.0)) * losses["t0_narrowband"]
+        + float(cfg.get("w_t0_softdice", 1.0)) * losses["t0_softdice"]
+        + float(cfg.get("w_t0_cldice", 0.5)) * losses["t0_cldice"]
+    )
+    total = random_loss + endpoint_weight * t0_loss
+    components.update({name: float(value.detach()) for name, value in losses.items()})
+    components["total"] = float(total.detach())
+    return total, components
+
+
 # --------------------------------------------------------------------------- #
 # Laterality loss — disjoint L/R, no side swap
 # --------------------------------------------------------------------------- #
