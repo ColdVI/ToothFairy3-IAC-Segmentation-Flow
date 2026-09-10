@@ -1,6 +1,14 @@
 # IAC-Flow — Left/Right Inferior Alveolar Canal segmentation (ToothFairy3)
 
-**Goal (v1.0):** a strong nnU-Net baseline that segments the **left** and **right**
+> **September 2026 update:** the repository now contains two deliberately
+> separated research tracks. The original `flow/` directory is the historical
+> nnU-Net-prior residual-flow implementation. The new `iacflow/` package and
+> [`notebooks/IAC_Flow_Training.ipynb`](notebooks/IAC_Flow_Training.ipynb)
+> implement a genuine conditional Gaussian-to-SDF Flow Matching experiment in
+> which the final mask is decoded from the integrated flow state. See
+> [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md) before comparing scores.
+
+**Original goal (v1.0):** a strong nnU-Net baseline that segments the **left** and **right**
 inferior alveolar canal (IAC) as separate classes, then a **topology-aware,
 SDF-based Conditional Residual Flow Matching** model that *refines* the nnU-Net
 prediction — improving canal continuity, boundary accuracy and cross-scanner
@@ -18,6 +26,14 @@ The key design difference from prior flow-segmentation work (and from SEAL-Flow)
 the flow does not start from noise, it starts from `x0 = SDF(nnU-Net prediction)`
 and learns the residual transport to `x1 = SDF(ground truth)`. This is trained
 **leakage-free** on out-of-fold nnU-Net predictions.
+
+That paragraph describes the historical residual-flow track. The current
+`iacflow/` track asks a different question: can a checkpoint-initialized,
+image-conditional SDF flow use its evolving state so that NFE>1 improves
+connectivity over the same trained model at NFE=1, without a meaningful Dice
+loss? It starts from Gaussian noise rather than the frozen nnU-Net mask. The
+pretrained nnU-Net supplies initialization and trainable image features; its
+segmentation is not post-hoc fused into the final prediction.
 
 ## Dataset — ToothFairy3, not ToothFairy4
 
@@ -83,6 +99,17 @@ archive/     v0 flat flow, old ClaudeResponse duplicates, original browser MEMOR
 python flow/selftest.py            # residual refinement machinery (coarse Dice -> higher)
 python tests/test_flow_shapes.py   # (and the other 4 test files)
 ```
+
+For the current conditional FM track:
+
+```bash
+PYTHONPATH=. python -m pytest tests/test_iacflow_engineering.py -q
+```
+
+The self-contained notebook includes its source payload and can be uploaded
+directly to Colab or another rented-GPU Jupyter environment. Edit only the
+visible `/EDIT/...` paths; datasets, checkpoints and caches are intentionally
+excluded from this repository.
 
 ## Persistent Colab + Drive Prompt-1 workflow
 

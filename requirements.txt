@@ -3,6 +3,10 @@ nibabel>=5.0
 numpy>=1.24
 scipy>=1.10
 scikit-image>=0.21
+pandas>=2.1        # current iacflow notebook reports and CSV summaries
+matplotlib>=3.8    # current iacflow notebook diagnostics
 pyyaml>=6.0         # config files (flow/train.py falls back to JSON if absent)
 torch>=2.1          # CPU is fine for editing/selftest/tests; CUDA build needed for real training
 nnunetv2            # only needed for Track A (nnU-Net baseline)
+# Keep the rented GPU image's CUDA-compatible torch build. If needed, install
+# dynamic-network-architectures==0.4.4 with --no-deps rather than replacing torch.
