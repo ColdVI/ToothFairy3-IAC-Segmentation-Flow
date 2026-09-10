@@ -7,6 +7,13 @@
 # generated outputs / caches
 outputs/
 *.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.csv.lock
+iac_flow_cache/
+iac_flow_run/
 nnUNet_raw/
 nnUNet_preprocessed/
 nnUNet_results/
