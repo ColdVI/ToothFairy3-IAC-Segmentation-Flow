@@ -1,0 +1,123 @@
+paths:
+  dataset_root: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/dataset_cache_colab_v2/Dataset801_IAC_LR
+  splits_file: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/configs_cache/splits.json
+  oof_probability_root: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/canalmanifold_oof_softmax
+  oof_probability_pattern: "{root}/fold_{fold}/{case}.npz"
+  # Set these two paths for the full canonical condition. If omitted, the
+  # runnable probability/image-condition arm is used.
+  # oof_feature_root: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/oof_decoder_features
+  # oof_feature_pattern: "{root}/fold_{fold}/{case}.npz"
+  manifest_file: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/manifest.json
+  cache_dir: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/cache_m8_v2
+  dense_cache_dir: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/dense_sdf_cache_v2
+  run_dir: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/runs_v2
+
+manifest:
+  # For the 3-class IAC model these are normally 1 and 2. They are explicit
+  # because probability channels are not raw ToothFairy3 label IDs.
+  probability_left_channel: 1
+  probability_right_channel: 2
+  require_decoder_features: false
+
+nnunet_oof:
+  model_folder: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/nnUNet_results/Dataset801_IAC_LR/nnUNetTrainerIAC_NoMirror__nnUNetPlans__3d_fullres
+  checkpoint_name: checkpoint_final.pth
+  tile_step_size: 0.5
+  use_mirroring: false
+  preprocess_workers: 2
+  export_workers: 2
+
+geometry:
+  stations: 160
+  angles: 32
+  shell_radii: 24
+  fit_radii: 40
+  free_fit_radii: 64
+  max_radius_mm: 5.0
+  centerline_smoothing_mm: 0.45
+  endpoint_margin_mm: 4.0
+  max_center_shift_mm: 3.0
+  probability_threshold: 0.5
+  minimum_identity_dice: 0.80
+  minimum_ceiling_dice: 0.85
+
+model:
+  d_model: 192
+  n_heads: 6
+  n_layers: 4
+  angular_hidden: 64
+  angular_modes: 8
+  dropout: 0.10
+  profile_offsets_mm: [-0.6, -0.3, 0.0, 0.3, 0.6]
+  probability_channel: 1
+  evidence_threshold: 0.5
+  evidence_radii: 32
+
+training:
+  seed: 20260826
+  batch_size: 8
+  dataloader_workers: 2
+  cache_in_ram: false
+  exclude_fallback: true
+  epochs_direct: 100
+  epochs_flow: 60
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  endpoint_weight: 1.0
+  decoded_dice_weight: 0.30
+  decoded_temperature_mm: 0.10
+  path_noise_fraction: 0.10
+  q0_jitter_fraction: 0.20
+  gradient_clip: 1.0
+  amp: true
+  heun_steps: 4
+  checkpoint_every_epochs: 1
+  selection_every_epochs: 2
+  archive_checkpoint_every_epochs: 2
+  allow_cpu_training: false
+
+surface_model:
+  d_model: 192
+  n_heads: 6
+  n_layers: 4
+  angle_hidden: 48
+  angular_modes: 8
+  dropout: 0.10
+  profile_offsets_mm: [-0.6, -0.3, 0.0, 0.3, 0.6]
+  probability_channel: 1
+  evidence_threshold: 0.5
+  trust_surface_rmse_mm: 1.0
+  trust_endpoint_mm: 2.0
+
+surface_training:
+  epochs_surface: 60
+  archive_checkpoint_every_epochs: 2
+
+dense:
+  patch_shape: [96, 96, 128]
+  crop_margin_mm: 6.0
+  max_sdf_mm: 8.0
+  base_channels: 24
+  dropout: 0.0
+  batch_size: 1
+  dataloader_workers: 2
+  epochs: 60
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  band_sigma_mm: 1.0
+  decoded_dice_weight: 0.30
+  decoded_temperature_mm: 0.10
+  path_noise_fraction: 0.10
+  q0_jitter_fraction: 0.20
+  heun_steps: 4
+  archive_checkpoint_every_epochs: 2
+  amp: true
+  allow_cpu_training: false
+
+runtime:
+  precompute_workers: 2
+
+evaluation:
+  dice_margin: 0.002
+  minimum_component_volume_mm3: 0.27
+  normal_displacement_limit_mm: 1.0

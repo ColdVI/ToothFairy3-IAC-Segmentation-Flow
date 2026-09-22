@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canalmanifold-flow"
+version = "0.4.0"
+description = "Corrected geometric boundary flow for ToothFairy3 IAC refinement"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.11",
+  "nibabel>=5.2",
+  "scikit-image>=0.22",
+  "pandas>=2.0",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["canalmanifold*"]

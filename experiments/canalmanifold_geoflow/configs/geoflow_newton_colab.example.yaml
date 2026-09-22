@@ -1,0 +1,88 @@
+paths:
+  dataset_root: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/dataset_cache_colab_v2/Dataset801_IAC_LR
+  splits_file: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/configs_cache/splits.json
+  oof_probability_root: /content/drive/MyDrive/ToothFairy/ToothFairy3/iac_runs/canalmanifold_oof_softmax
+  oof_probability_pattern: "{root}/fold_{fold}/{case}.npz"
+  manifest_file: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/manifest.json
+  cache_dir: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/v2/cache_m8_v2
+  dense_cache_dir: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/v2/dense_sdf_cache
+  run_dir: /content/drive/MyDrive/ToothFairy/ToothFairy3/canalmanifold/v2/runs
+
+manifest:
+  probability_left_channel: 1
+  probability_right_channel: 2
+  require_decoder_features: false
+
+geometry:
+  stations: 160
+  angles: 32
+  shell_radii: 24
+  fit_radii: 40
+  free_fit_radii: 64
+  max_radius_mm: 5.0
+  centerline_smoothing_mm: 0.45
+  endpoint_margin_mm: 4.0
+  max_center_shift_mm: 3.0
+  probability_threshold: 0.5
+  minimum_identity_dice: 0.80
+  minimum_ceiling_dice: 0.85
+
+surface_model:
+  # Fallback values for old R2 only; GeoFlow overrides its own architecture.
+  profile_offsets_mm: [-0.6, -0.3, 0.0, 0.3, 0.6]
+  probability_channel: 1
+  evidence_threshold: 0.5
+
+geoflow_model:
+  d_model: 64
+  n_heads: 4
+  n_layers: 2
+  angle_hidden: 24
+  angular_modes: 6
+  dropout: 0.10
+  profile_offsets_mm: [-0.6, -0.3, 0.0, 0.3, 0.6]
+  probability_channel: 1
+  evidence_threshold: 0.5
+  minimum_slope_per_mm: 0.05
+  maximum_newton_step_mm: 0.60
+  sharpness_cap_per_mm: 4.0
+  evidence_gain_limit: 2.0
+  evidence_gain_init: 0.0
+  curvature_ratio_limit: 4.0
+  axial_curvature_clip: 4.0
+  nominal_spacing_mm: 0.30
+  trust_surface_rmse_mm: 1.0
+  trust_endpoint_mm: 2.0
+
+training:
+  seed: 20260831
+  batch_size: 8
+  dataloader_workers: 2
+  cache_in_ram: false
+  exclude_fallback: true
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  endpoint_weight: 1.0
+  decoded_dice_weight: 0.30
+  decoded_temperature_mm: 0.10
+  path_noise_fraction: 0.10
+  q0_jitter_fraction: 0.20
+  gradient_clip: 1.0
+  amp: true
+  heun_steps: 4
+  allow_cpu_training: false
+
+geoflow_training:
+  epochs_geoflow: 60
+  archive_checkpoint_every_epochs: 1
+  # Alpha is gauge-identifiable in this build. Run it free first, then ablate.
+  dilation_penalty_weight: 0.0
+  evidence_gain_penalty_weight: 0.0
+
+runtime:
+  precompute_workers: 2
+
+evaluation:
+  dice_margin: 0.002
+  minimum_component_volume_mm3: 0.27
+  normal_displacement_limit_mm: 1.0
