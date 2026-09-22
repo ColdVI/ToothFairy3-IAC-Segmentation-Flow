@@ -1,0 +1,9 @@
+# Colab already ships a CUDA-enabled PyTorch build. Do not reinstall torch.
+numpy>=1.24
+scipy>=1.11
+nibabel>=5.2
+scikit-image>=0.22
+pandas>=2.0
+PyYAML>=6.0
+tqdm>=4.66
+

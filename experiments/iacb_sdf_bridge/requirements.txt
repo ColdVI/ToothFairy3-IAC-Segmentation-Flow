@@ -1,0 +1,6 @@
+# Install an appropriate CPU/CUDA PyTorch build separately.
+numpy>=1.24
+scipy>=1.11
+pandas>=2.0
+scikit-image>=0.22
+SimpleITK>=2.3
